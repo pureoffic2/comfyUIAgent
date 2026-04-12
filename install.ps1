@@ -77,7 +77,7 @@ if ($DisplayName.Trim()) {
 }
 
 if (-not $SkipStartupTask) {
-    Write-Step "Configuring startup task"
+    Write-Step "Configuring startup entry"
     $env:PCBOT_STARTUP_TASK_NAME = $TaskName
     Invoke-Checked -Command @($venvPython, $agentPath, "--install-startup")
 }
@@ -101,7 +101,7 @@ $installPath
 Agent file:
 $agentPath
 
-Startup task:
+Startup entry:
 $TaskName
 "@
 $installSummary | Set-Content -Path $readmePath -Encoding UTF8
@@ -109,5 +109,5 @@ $installSummary | Set-Content -Path $readmePath -Encoding UTF8
 Write-Host ""
 Write-Host "Done."
 Write-Host "Folder: $installPath"
-Write-Host "Startup task: $TaskName"
+Write-Host "Startup entry: $TaskName"
 Write-Host "The PC should appear in Telegram after the next heartbeat."
