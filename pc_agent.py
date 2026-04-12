@@ -678,14 +678,20 @@ def install_startup_task() -> None:
     pythonw_exe = python_exe.with_name("pythonw.exe")
     launcher = pythonw_exe if pythonw_exe.exists() else python_exe
     script_path = str(Path(__file__).resolve())
-    task_name = os.environ.get("PCBOT_STARTUP_TASK_NAME", "SchoolProAgent").strip() or "SchoolProAgent"
-    command = (
-        f'schtasks /Create /SC ONLOGON /TN "{task_name}" '
-        f'/TR "\\"{launcher}\\" \\"{script_path}\\"" /RL LIMITED /F'
+    entry_name = os.environ.get("PCBOT_STARTUP_TASK_NAME", "SchoolProAgent").strip() or "SchoolProAgent"
+    startup_dir = Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+    startup_dir.mkdir(parents=True, exist_ok=True)
+    launcher_path = startup_dir / f"{entry_name}.cmd"
+    launcher_path.write_text(
+        "\r\n".join(
+            [
+                "@echo off",
+                f'start "" "{launcher}" "{script_path}"',
+                "",
+            ]
+        ),
+        encoding="ascii",
     )
-    result = subprocess.run(command, shell=True, check=False)
-    if result.returncode != 0:
-        raise RuntimeError("Не удалось создать задачу планировщика.")
 
 
 def handle_command(command: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -766,7 +772,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--install-startup",
         action="store_true",
-        help="Create a visible Task Scheduler entry for logon startup",
+        help="Create a Startup-folder entry for logon startup",
     )
     return parser.parse_args()
 
@@ -835,7 +841,7 @@ def main() -> None:
 
     if args.install_startup:
         install_startup_task()
-        print("Автозапуск через планировщик установлен.")
+        print("Автозапуск через папку Startup установлен.")
         return
 
     if changed_state:
