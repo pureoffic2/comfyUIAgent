@@ -40,6 +40,7 @@ with contextlib.suppress(ImportError):
 
 
 EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+GetForegroundWindow = ctypes.windll.user32.GetForegroundWindow
 GetSystemMetrics = ctypes.windll.user32.GetSystemMetrics
 GetWindowThreadProcessId = ctypes.windll.user32.GetWindowThreadProcessId
 IsWindowVisible = ctypes.windll.user32.IsWindowVisible
@@ -60,20 +61,20 @@ DEFAULT_AGENT_UPDATE_URL = os.environ.get(
     "https://raw.githubusercontent.com/pureoffic2/comfyUIAgent/main/pc_agent.py",
 ).strip()
 HEARTBEAT_INTERVAL_SECONDS = max(5.0, float(os.environ.get("PCBOT_HEARTBEAT_INTERVAL", "10")))
-COMMAND_POLL_SECONDS = max(0.35, float(os.environ.get("PCBOT_COMMAND_POLL", "0.6")))
-HTTP_TIMEOUT_SECONDS = max(5, int(os.environ.get("PCBOT_HTTP_TIMEOUT", "15")))
+COMMAND_POLL_SECONDS = max(0.12, float(os.environ.get("PCBOT_COMMAND_POLL", "0.18")))
+HTTP_TIMEOUT_SECONDS = max(5, int(os.environ.get("PCBOT_HTTP_TIMEOUT", "12")))
 WIFI_RECOVERY_COOLDOWN_SECONDS = max(10.0, float(os.environ.get("PCBOT_WIFI_RECOVERY_COOLDOWN", "35")))
 WIFI_CONNECT_SETTLE_SECONDS = max(3.0, float(os.environ.get("PCBOT_WIFI_CONNECT_SETTLE", "6")))
 TEXT_WINDOW_SECONDS = max(5, int(os.environ.get("PCBOT_TEXT_WINDOW_SECONDS", "25")))
-AGENT_VERSION = "1.3.0"
+AGENT_VERSION = "1.4.0"
 SHELL_COMMAND_TIMEOUT_SECONDS = 25
 SHELL_COMMAND_CWD = str(Path.home())
 SHELL_COMMAND_PREVIEW_CHARS = 1600
 DEFAULT_STARTUP_ENTRY_NAME = "SchoolProAgent"
 LEGACY_STARTUP_ENTRY_NAMES = ("SafePcTelegramAgent",)
-REMOTE_FRAME_MAX_WIDTH = 1440
-REMOTE_FRAME_MAX_HEIGHT = 900
-REMOTE_FRAME_QUALITY = 62
+REMOTE_FRAME_MAX_WIDTH = 1280
+REMOTE_FRAME_MAX_HEIGHT = 720
+REMOTE_FRAME_QUALITY = 48
 STANDARD_SCREENSHOT_MAX_WIDTH = 1600
 STANDARD_SCREENSHOT_MAX_HEIGHT = 900
 STANDARD_SCREENSHOT_QUALITY = 72
@@ -289,6 +290,32 @@ def ensure_single_instance() -> bool:
     return True
 
 
+def hidden_startupinfo() -> Any | None:
+    if os.name != "nt":
+        return None
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0
+    return startupinfo
+
+
+def hidden_subprocess_kwargs() -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = CREATE_NO_WINDOW
+        startupinfo = hidden_startupinfo()
+        if startupinfo is not None:
+            kwargs["startupinfo"] = startupinfo
+    return kwargs
+
+
+def boost_process_priority() -> None:
+    with contextlib.suppress(Exception):
+        proc = psutil.Process()
+        if hasattr(psutil, "HIGH_PRIORITY_CLASS"):
+            proc.nice(psutil.HIGH_PRIORITY_CLASS)
+
+
 def stable_device_id() -> str:
     seed = f"{socket.gethostname().lower()}-{uuid.getnode()}"
     return uuid.uuid5(uuid.NAMESPACE_DNS, seed).hex[:16]
@@ -375,7 +402,7 @@ def cleanup_legacy_scheduled_tasks() -> None:
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=CREATE_NO_WINDOW,
+            **hidden_subprocess_kwargs(),
         )
 
 
@@ -608,18 +635,39 @@ class WlanClient:
 
 
 def list_wifi_profiles() -> list[str]:
-    if not wlan_available():
-        return []
     names: list[str] = []
+    if wlan_available():
+        try:
+            with WlanClient() as client:
+                for interface_info in client.interfaces():
+                    for profile in client.profiles(interface_info.InterfaceGuid):
+                        name = profile.strProfileName.strip()
+                        if name and name not in names:
+                            names.append(name)
+        except Exception:
+            pass
+    if names:
+        return names
     try:
-        with WlanClient() as client:
-            for interface_info in client.interfaces():
-                for profile in client.profiles(interface_info.InterfaceGuid):
-                    name = profile.strProfileName.strip()
-                    if name and name not in names:
-                        names.append(name)
+        completed = subprocess.run(
+            ["netsh", "wlan", "show", "profiles"],
+            check=False,
+            capture_output=True,
+            text=False,
+            timeout=12,
+            **hidden_subprocess_kwargs(),
+        )
     except Exception:
         return []
+    text = decode_process_output(completed.stdout)
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        lower = line.lower()
+        if ":" not in line or ("profile" not in lower and "профиль" not in lower):
+            continue
+        name = line.split(":", 1)[1].strip()
+        if name and name not in names:
+            names.append(name)
     return names
 
 
@@ -646,47 +694,82 @@ def network_reachable(timeout: float = 2.0) -> bool:
     return False
 
 
-def get_wifi_status() -> dict[str, Any]:
+def current_wifi_connection() -> tuple[str | None, int | None]:
+    try:
+        completed = subprocess.run(
+            ["netsh", "wlan", "show", "interfaces"],
+            check=False,
+            capture_output=True,
+            text=False,
+            timeout=10,
+            **hidden_subprocess_kwargs(),
+        )
+    except Exception:
+        return None, None
+    text = decode_process_output(completed.stdout) + "\n" + decode_process_output(completed.stderr)
+    if "location permission" in text.lower() or "requires elevation" in text.lower():
+        return None, None
+    profile_name = None
+    signal = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or ":" not in line:
+            continue
+        key, value = [part.strip() for part in line.split(":", 1)]
+        lower_key = key.lower()
+        lower_value = value.lower()
+        if "ssid" in lower_key and "bssid" not in lower_key and value:
+            profile_name = value
+        if ("profile" in lower_key or "профиль" in lower_key) and value and lower_value != "n/a":
+            profile_name = value
+        if ("signal" in lower_key or "сигнал" in lower_key) and value.endswith("%"):
+            with contextlib.suppress(ValueError):
+                signal = int(value.rstrip("% ").strip())
+    return profile_name, signal
+
+
+def get_wifi_status(include_connection: bool = False) -> dict[str, Any]:
     info: dict[str, Any] = {
         "profiles": [],
         "visible_profiles": [],
         "connected_profile": None,
         "connected_signal": None,
-        "available": wlan_available(),
+        "available": wlan_available() or bool(list_wifi_profiles()),
         "internet_ok": network_reachable(timeout=1.0),
     }
-    if not info["available"]:
-        return info
-    try:
-        with WlanClient() as client:
-            profiles = list_wifi_profiles()
-            visible_rows: list[dict[str, Any]] = []
-            connected_profile = None
-            connected_signal = None
-            for interface_info in client.interfaces():
-                for network in client.available_networks(interface_info.InterfaceGuid):
-                    profile_name = network.strProfileName.strip() or decode_dot11_ssid(network.dot11Ssid)
-                    if not profile_name:
-                        continue
-                    row = {
-                        "profile": profile_name,
-                        "ssid": decode_dot11_ssid(network.dot11Ssid),
-                        "signal": int(network.wlanSignalQuality),
-                        "connected": bool(network.dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED),
-                        "has_profile": bool(network.dwFlags & WLAN_AVAILABLE_NETWORK_HAS_PROFILE),
-                    }
-                    visible_rows.append(row)
-                    if row["connected"] and connected_profile is None:
-                        connected_profile = profile_name
-                        connected_signal = row["signal"]
-            visible_rows.sort(key=lambda item: (0 if item["connected"] else 1, -item["signal"], item["profile"].lower()))
-            info["profiles"] = profiles
-            info["visible_profiles"] = visible_rows
-            info["connected_profile"] = connected_profile
-            info["connected_signal"] = connected_signal
-            return info
-    except Exception:
-        return info
+    info["profiles"] = list_wifi_profiles()
+    if include_connection:
+        info["connected_profile"], info["connected_signal"] = current_wifi_connection()
+    return info
+
+
+def connect_wifi_profile(profile_name: str) -> None:
+    stripped = profile_name.strip()
+    if not stripped:
+        raise ValueError("Пустое имя Wi-Fi профиля.")
+    if wlan_available():
+        try:
+            with WlanClient() as client:
+                interfaces = client.interfaces()
+                if interfaces:
+                    client.connect_profile(interfaces[0].InterfaceGuid, stripped)
+                    return
+        except Exception:
+            pass
+    completed = subprocess.run(
+        ["netsh", "wlan", "connect", f"name={stripped}"],
+        check=False,
+        capture_output=True,
+        text=False,
+        timeout=15,
+        **hidden_subprocess_kwargs(),
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            decode_process_output(completed.stderr)
+            or decode_process_output(completed.stdout)
+            or f"netsh exit {completed.returncode}"
+        )
 
 
 def attempt_wifi_recovery() -> dict[str, Any]:
@@ -694,16 +777,7 @@ def attempt_wifi_recovery() -> dict[str, Any]:
     if not status.get("available"):
         raise ValueError("На этом ПК не найден Wi-Fi интерфейс.")
 
-    profiles = [str(name) for name in status.get("profiles", []) if str(name).strip()]
-    visible_rows = [row for row in status.get("visible_profiles", []) if row.get("has_profile")]
-    ordered: list[str] = []
-    for row in visible_rows:
-        name = str(row.get("profile", "")).strip()
-        if name and name not in ordered:
-            ordered.append(name)
-    for name in profiles:
-        if name not in ordered:
-            ordered.append(name)
+    ordered = [str(name) for name in status.get("profiles", []) if str(name).strip()]
     if not ordered:
         raise ValueError("Не найдено сохранённых Wi-Fi профилей для переподключения.")
 
@@ -740,6 +814,42 @@ def attempt_wifi_recovery() -> dict[str, Any]:
         "Не удалось восстановить Wi-Fi автоматически. Попробованы профили: "
         + ", ".join(attempts)
     )
+
+
+def attempt_wifi_recovery_safe() -> dict[str, Any]:
+    status = get_wifi_status(include_connection=True)
+    if not status.get("available"):
+        raise ValueError("На этом ПК не найден Wi-Fi адаптер или Windows не даёт доступ к WLAN API.")
+
+    ordered = [str(name) for name in status.get("profiles", []) if str(name).strip()]
+    if not ordered:
+        raise ValueError("Не найдены сохранённые Wi-Fi профили для переподключения.")
+
+    attempts: list[str] = []
+    for profile_name in ordered[:8]:
+        attempts.append(profile_name)
+        try:
+            connect_wifi_profile(profile_name)
+        except Exception:
+            continue
+        deadline = time.time() + WIFI_CONNECT_SETTLE_SECONDS
+        while time.time() < deadline:
+            refreshed = get_wifi_status(include_connection=True)
+            connected = refreshed.get("connected_profile")
+            if network_reachable(timeout=1.0) or (connected and connected.lower() == profile_name.lower()):
+                signal = refreshed.get("connected_signal")
+                signal_text = f" ({signal}%)" if isinstance(signal, int) else ""
+                return {
+                    "ok": True,
+                    "message": f"Wi-Fi восстановлен через профиль {connected or profile_name}{signal_text}.",
+                    "data": {
+                        "profile": connected or profile_name,
+                        "attempts": attempts,
+                        "wifi": refreshed,
+                    },
+                }
+            time.sleep(1.0)
+    raise ValueError("Не удалось восстановить Wi-Fi автоматически. Попробованы профили: " + ", ".join(attempts))
 
 
 def collect_snapshot(previous_net: dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1065,7 +1175,7 @@ def start_alias(alias: str) -> str:
     if command_line.lower().endswith(".exe") and " " not in command_line.strip():
         os.startfile(command_line)
     else:
-        subprocess.Popen(shlex.split(command_line, posix=False), shell=False)
+        subprocess.Popen(shlex.split(command_line, posix=False), shell=False, **hidden_subprocess_kwargs())
     return f"Запущено: {alias}."
 
 
@@ -1082,6 +1192,7 @@ def run_job(alias: str) -> str:
             shlex.split(command_line, posix=False),
             shell=False,
             cwd=cwd,
+            **hidden_subprocess_kwargs(),
         )
     return f"Джоба запущена: {alias}."
 
@@ -1134,6 +1245,15 @@ def close_process(target: str) -> str:
     if total == 0:
         return f"Видимых окон для {target} не найдено."
     return f"Запрошено закрытие. PID/процесс: {target}. Окон: {total}."
+
+
+def close_foreground_window() -> str:
+    hwnd = int(GetForegroundWindow())
+    if not hwnd:
+        raise ValueError("Активное окно не найдено.")
+    title = get_window_title(hwnd) or "без названия"
+    PostMessageW(hwnd, WM_CLOSE, 0, 0)
+    return f"Команда закрытия отправлена для верхнего окна: {title}."
 
 
 def terminate_process(target: str) -> str:
@@ -1216,12 +1336,12 @@ def lock_pc() -> str:
 
 
 def restart_pc() -> str:
-    subprocess.Popen(["shutdown", "/r", "/t", "5"], shell=False)
+    subprocess.Popen(["shutdown", "/r", "/t", "5"], shell=False, **hidden_subprocess_kwargs())
     return "Перезагрузка запланирована через 5 секунд."
 
 
 def shutdown_pc() -> str:
-    subprocess.Popen(["shutdown", "/s", "/t", "5"], shell=False)
+    subprocess.Popen(["shutdown", "/s", "/t", "5"], shell=False, **hidden_subprocess_kwargs())
     return "Выключение запланировано через 5 секунд."
 
 
@@ -1454,7 +1574,7 @@ def uninstall_self() -> dict[str, Any]:
     subprocess.Popen(
         ["cmd.exe", "/c", str(cleanup_script)],
         shell=False,
-        creationflags=CREATE_NO_WINDOW,
+        **hidden_subprocess_kwargs(),
     )
     return {
         "ok": True,
@@ -1500,7 +1620,7 @@ def restart_self() -> None:
         [str(launcher), str(Path(__file__).resolve())],
         shell=False,
         cwd=str(BASE_DIR),
-        creationflags=CREATE_NO_WINDOW,
+        **hidden_subprocess_kwargs(),
     )
 
 
@@ -1611,7 +1731,7 @@ def show_text_popup(text: str) -> dict[str, Any]:
         ],
         shell=False,
         cwd=str(BASE_DIR),
-        creationflags=CREATE_NO_WINDOW,
+        **hidden_subprocess_kwargs(),
     )
     return {
         "ok": True,
@@ -1676,7 +1796,7 @@ def maybe_recover_wifi(last_attempt_at: float, reason: str, force: bool = False)
     if not force and (time.time() - last_attempt_at) < WIFI_RECOVERY_COOLDOWN_SECONDS:
         return last_attempt_at, None
     try:
-        result = attempt_wifi_recovery()
+        result = attempt_wifi_recovery_safe()
         message = result.get("message", f"Wi-Fi recovery ok ({reason}).")
     except Exception as exc:
         message = f"Wi-Fi recovery failed ({reason}): {exc}"
@@ -1759,6 +1879,8 @@ def handle_command(command: dict[str, Any], snapshot: dict[str, Any], session: r
     if command_type == "close_app":
         target = str(args.get("target") or args.get("alias") or "").strip()
         return {"ok": True, "message": close_process(target), "data": {"target": target}}
+    if command_type == "close_foreground_window":
+        return {"ok": True, "message": close_foreground_window(), "data": {}}
     if command_type == "kill_process":
         target = str(args.get("target") or "").strip()
         return {"ok": True, "message": terminate_process(target), "data": {"target": target}}
@@ -1774,7 +1896,7 @@ def handle_command(command: dict[str, Any], snapshot: dict[str, Any], session: r
     if command_type == "show_text":
         return show_text_popup(str(args.get("text", "")))
     if command_type == "wifi_recover":
-        return attempt_wifi_recovery()
+        return attempt_wifi_recovery_safe()
     if command_type == "self_update":
         return perform_self_update(session)
     if command_type == "uninstall_self":
@@ -1796,6 +1918,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_loop() -> None:
+    boost_process_priority()
     session = requests.Session()
     previous_net: dict[str, Any] | None = None
     cached_snapshot: dict[str, Any] | None = None
@@ -1903,6 +2026,7 @@ def main() -> None:
     if not ensure_single_instance():
         return
 
+    boost_process_priority()
     run_loop()
 
 

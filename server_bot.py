@@ -37,12 +37,12 @@ API_PORT = int(os.environ.get("PCBOT_PORT", "8080"))
 ONLINE_TIMEOUT_SECONDS = int(os.environ.get("PCBOT_ONLINE_TIMEOUT", "45"))
 PRESENCE_SWEEP_INTERVAL_SECONDS = int(os.environ.get("PCBOT_PRESENCE_SWEEP_INTERVAL", "5"))
 COMMAND_TIMEOUT_SECONDS = int(os.environ.get("PCBOT_COMMAND_TIMEOUT", "35"))
-COMMAND_RESULT_POLL_INTERVAL_SECONDS = float(os.environ.get("PCBOT_COMMAND_POLL_INTERVAL", "0.35"))
+COMMAND_RESULT_POLL_INTERVAL_SECONDS = float(os.environ.get("PCBOT_COMMAND_POLL_INTERVAL", "0.12"))
 CMD_COMMAND_PREVIEW_CHARS = int(os.environ.get("PCBOT_CMD_COMMAND_PREVIEW", "400"))
 CMD_OUTPUT_PREVIEW_CHARS = int(os.environ.get("PCBOT_CMD_OUTPUT_PREVIEW", "1000"))
 PUBLIC_BASE_URL = os.environ.get("PCBOT_PUBLIC_BASE_URL", "").strip().rstrip("/")
 REMOTE_SESSION_TTL_SECONDS = int(os.environ.get("PCBOT_REMOTE_SESSION_TTL", "43200"))
-REMOTE_FRAME_TIMEOUT_SECONDS = int(os.environ.get("PCBOT_REMOTE_FRAME_TIMEOUT", "25"))
+REMOTE_FRAME_TIMEOUT_SECONDS = int(os.environ.get("PCBOT_REMOTE_FRAME_TIMEOUT", "12"))
 AUTO_PUBLIC_TUNNEL = os.environ.get("PCBOT_AUTO_PUBLIC_TUNNEL", "1").strip().lower() not in {"0", "false", "off", "no"}
 CLOUDFLARED_DIR = DATA_DIR / "cloudflared"
 CLOUDFLARED_BIN = CLOUDFLARED_DIR / ("cloudflared.exe" if os.name == "nt" else "cloudflared")
@@ -799,6 +799,8 @@ def devices_keyboard(devices: list[dict[str, Any]], current_id: str | None = Non
         )
     if not rows:
         rows = [[InlineKeyboardButton("Пока нет устройств", callback_data="noop")]]
+    if current_id:
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="action:menu_root")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -812,7 +814,7 @@ def public_remote_supported() -> bool:
 
 def device_home_text(device: dict[str, Any]) -> str:
     return (
-        "<b>Панель ПК</b>\n"
+        "<b>🖥 Панель ПК</b>\n"
         f"ПК: <b>{html.escape(device.get('display_name', device['device_id']))}</b>\n"
         f"Статус: {html.escape(status_icon(device))} <code>{status_badge(device)}</code>\n"
         f"Heartbeat: {html.escape(format_relative_age(device.get('last_seen')))}\n\n"
@@ -880,10 +882,13 @@ def control_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🔁 Рестарт", callback_data="action:restart"),
             ],
             [
-                InlineKeyboardButton("⛔ Выключить", callback_data="action:shutdown"),
+                InlineKeyboardButton("🪟 Закрыть окно", callback_data="action:close_active"),
                 InlineKeyboardButton("💬 /text", callback_data="action:text_help"),
             ],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="action:menu_root")],
+            [
+                InlineKeyboardButton("⛔ Выключить", callback_data="action:shutdown"),
+                InlineKeyboardButton("⬅️ Назад", callback_data="action:menu_root"),
+            ],
         ]
     )
 
@@ -925,10 +930,10 @@ def delete_confirm_keyboard(device_id: str) -> InlineKeyboardMarkup:
 
 def delete_prompt_text(device: dict[str, Any]) -> str:
     return (
-        "<b>Удаление SchoolPro</b>\n"
+        "<b>🗑 Удаление SchoolPro</b>\n"
         f"Устройство: <b>{html.escape(device.get('display_name', device['device_id']))}</b>\n"
         f"ID: <code>{html.escape(device.get('device_id', 'n/a'))}</code>\n\n"
-        "После подтверждения агент остановится, удалит папку SchoolPro, уберет автозапуск и исчезнет из списка устройств."
+        "После подтверждения устройство сразу исчезнет из списка. Если агент онлайн, бот ещё и отправит ему команду на самоустановку удаления."
     )
 
 
@@ -943,8 +948,7 @@ def app_keyboard(app_lines: list[str]) -> InlineKeyboardMarkup | None:
         rows.append(
             [InlineKeyboardButton(f"Закрыть {pid} {name}", callback_data=f"proc:close:{pid}")]
         )
-    if not rows:
-        return None
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="action:section:apps")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -959,8 +963,7 @@ def process_keyboard(process_lines: list[str]) -> InlineKeyboardMarkup | None:
         rows.append(
             [InlineKeyboardButton(f"Завершить {pid} {name}", callback_data=f"proc:kill:{pid}")]
         )
-    if not rows:
-        return None
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="action:section:apps")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -969,8 +972,7 @@ def jobs_keyboard(job_names: list[str]) -> InlineKeyboardMarkup | None:
         [InlineKeyboardButton(f"Запустить {job}", callback_data=f"job:run:{job}")]
         for job in job_names[:10]
     ]
-    if not rows:
-        return None
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="action:section:apps")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1067,7 +1069,7 @@ async def show_device_root(
 
 
 def section_text(title: str, description: str) -> str:
-    return f"<b>{html.escape(title)}</b>\n{html.escape(description)}"
+    return f"<b>✨ {html.escape(title)}</b>\n{html.escape(description)}"
 
 
 def extract_command_text(update: Update) -> str:
@@ -1201,6 +1203,14 @@ async def send_result(
         items = payload.get("data", {}).get("jobs", [])
         if isinstance(items, list):
             reply_markup = jobs_keyboard([str(item) for item in items])
+    if command_type in {"info", "uptime", "net", "drives", "services", "screenshot"}:
+        reply_markup = monitor_keyboard()
+    if command_type in {"close_app", "kill_process", "run_job", "restart_app", "run_alias", "top", "apps", "jobs"} and reply_markup is None:
+        reply_markup = apps_section_keyboard()
+    if command_type in {"lock_pc", "restart_pc", "shutdown_pc", "show_text", "close_foreground_window"}:
+        reply_markup = control_keyboard()
+    if command_type in {"wifi_recover", "self_update"}:
+        reply_markup = maintenance_keyboard()
     file_path = payload.get("file_path")
     if file_path and Path(file_path).exists():
         with Path(file_path).open("rb") as handle:
@@ -1254,23 +1264,22 @@ async def delete_device_installation(
     if not device:
         await send_text(update, context, "Устройство не найдено.")
         return
-    if not is_online(device):
-        await send_text(update, context, "Устройство оффлайн. Сначала дождитесь, когда агент будет онлайн.")
-        return
-
-    await send_text(update, context, f"Запускаю удаление SchoolPro на {device['display_name']}...")
-    result = await run_and_wait(device_id, "uninstall_self")
-    if result is None:
-        await send_text(update, context, "Удаление не подтвердилось: устройство не ответило вовремя.")
-        return
-
-    payload = result.get("result", {})
-    if not payload.get("ok", False):
-        await send_text(update, context, f"Удаление не выполнено.\n{payload.get('message', 'Без деталей')}")
-        return
-
+    queued_remote_delete = False
+    if is_online(device):
+        with contextlib.suppress(Exception):
+            await store.queue_command(device_id, "uninstall_self")
+            queued_remote_delete = True
     await store.remove_device(device_id)
-    await send_text(update, context, f"SchoolPro удален с {device['display_name']}. Устройство убрано из списка.")
+    devices = await store.list_devices()
+    current = await selected_device(update.effective_chat.id) if update.effective_chat is not None else None
+    note = "Команда самоудаления отправлена." if queued_remote_delete else "Устройство просто убрано из списка бота."
+    await send_text(
+        update,
+        context,
+        f"<b>🗑 Устройство удалено</b>\n<b>{html.escape(device['display_name'])}</b> скрыто из списка.\n{html.escape(note)}",
+        reply_markup=devices_keyboard(devices, current["device_id"] if current else None),
+        parse_mode="HTML",
+    )
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1442,6 +1451,10 @@ async def shutdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await run_for_current(update, context, "shutdown_pc")
 
 
+async def close_active_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await run_for_current(update, context, "close_foreground_window", use_cache=False)
+
+
 async def wifi_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await run_for_current(update, context, "wifi_recover", use_cache=False)
 
@@ -1556,7 +1569,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await pcs_command(update, context)
         return
     if data == "action:help":
-        await send_text(update, context, help_text())
+        await send_text(update, context, help_text(), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="action:menu_root")]]))
         return
     if data == "action:menu_root":
         current = await selected_device(update.effective_chat.id)
@@ -1572,14 +1585,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
     if data == "action:remote_unavailable":
+        current = await selected_device(update.effective_chat.id)
         await send_text(
             update,
             context,
-            "Mini App появится тут, когда сервер будет доступен по HTTPS и будет задан PCBOT_PUBLIC_BASE_URL."
+            "Mini App ещё прогревается. Бот сам поднимает HTTPS-туннель и подтянет remote, как только публичный адрес станет готов.",
+            reply_markup=await root_menu_markup(update.effective_chat.id, current["device_id"]) if current else None,
         )
         return
     if data == "action:text_help":
-        await send_text(update, context, "Использование: /text <текст>")
+        await send_text(update, context, "Использование: /text <текст>", reply_markup=control_keyboard())
         return
     if data == "action:section:monitor":
         await send_text(
@@ -1674,6 +1689,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "action:lock": lock_command,
         "action:restart": restart_command,
         "action:shutdown": shutdown_command,
+        "action:close_active": close_active_command,
         "action:wifi": wifi_command,
         "action:update": update_agent_command,
     }
@@ -1850,11 +1866,20 @@ def remote_webapp_html(device_name: str) -> str:
     let pointerStart = null;
     let lastMoveAt = 0;
     let rightClickNext = false;
+    let frameInFlight = false;
+    let refreshTimer = null;
+    let refreshDelay = 700;
     function setStatus(text) {{
       statusEl.textContent = text;
     }}
     function api(path, options) {{
       return fetch(`${{basePath}}${{path}}`, Object.assign({{ cache: "no-store" }}, options || {{}}));
+    }}
+    function scheduleFrame(delay) {{
+      if (refreshTimer) {{
+        clearTimeout(refreshTimer);
+      }}
+      refreshTimer = setTimeout(() => loadFrame(), delay);
     }}
     function localToRemote(event) {{
       const rect = screen.getBoundingClientRect();
@@ -1866,14 +1891,22 @@ def remote_webapp_html(device_name: str) -> str:
       }};
     }}
     async function sendInput(payload) {{
-      await api("/api/input", {{
+      const response = await api("/api/input", {{
         method: "POST",
         headers: {{ "Content-Type": "application/json" }},
         body: JSON.stringify(payload),
       }});
+      if (!response.ok) {{
+        const data = await response.json().catch(() => ({{ detail: "Input error" }}));
+        throw new Error(data.detail || "Input error");
+      }}
     }}
-    async function loadFrame() {{
-      overlay.style.display = "grid";
+    async function loadFrame(forceOverlay = false) {{
+      if (frameInFlight) return;
+      frameInFlight = true;
+      if (forceOverlay || !screen.src) {{
+        overlay.style.display = "grid";
+      }}
       try {{
         const response = await api("/api/frame");
         if (!response.ok) {{
@@ -1885,16 +1918,21 @@ def remote_webapp_html(device_name: str) -> str:
         const blob = await response.blob();
         const url = URL.createObjectURL(blob);
         screen.src = url;
+        refreshDelay = 450;
+        scheduleFrame(refreshDelay);
         setStatus(`Экран ${screenWidth}x${screenHeight} обновлён`);
         setTimeout(() => URL.revokeObjectURL(url), 4000);
       }} catch (error) {{
+        refreshDelay = Math.min(refreshDelay + 500, 2500);
+        scheduleFrame(refreshDelay);
         setStatus(error.message || "Не удалось получить экран");
       }} finally {{
+        frameInFlight = false;
         overlay.style.display = "none";
       }}
     }}
     refreshButton.addEventListener("click", () => {{
-      loadFrame();
+      loadFrame(true);
     }});
     rightClickButton.addEventListener("click", () => {{
       rightClickNext = true;
@@ -1946,11 +1984,11 @@ def remote_webapp_html(device_name: str) -> str:
         setStatus("Клик отправлен");
       }}
       pointerStart = null;
-      setTimeout(loadFrame, 250);
+      scheduleFrame(120);
     }}
     stage.addEventListener("pointerup", finishPointer);
     stage.addEventListener("pointercancel", finishPointer);
-    loadFrame();
+    loadFrame(true);
   </script>
 </body>
 </html>"""

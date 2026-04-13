@@ -80,6 +80,22 @@ function Invoke-Checked {
     }
 }
 
+function Invoke-HiddenPython {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$ArgumentList
+    )
+
+    $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -WindowStyle Hidden -PassThru -Wait
+    if ($process.ExitCode -ne 0) {
+        $commandText = ([string]::Join(" ", @($FilePath) + $ArgumentList))
+        throw ("Command failed with exit code {0}: {1}" -f $process.ExitCode, $commandText)
+    }
+}
+
 Enable-Tls12IfPossible
 $pythonCmd = Resolve-PythonCommand
 $installPath = [System.IO.Path]::GetFullPath($InstallDir)
@@ -105,17 +121,17 @@ Write-Step "Installing dependencies"
 Invoke-Checked -Command @($venvPython, "-m", "pip", "install", "requests", "psutil", "pillow")
 
 Write-Step "Saving update source"
-Invoke-Checked -Command @($venvPython, $agentPath, "--set-update-url", $AgentUrl)
+Invoke-HiddenPython -FilePath $venvPythonw -ArgumentList @($agentPath, "--set-update-url", $AgentUrl)
 
 if ($DisplayName.Trim()) {
     Write-Step "Setting device name"
-    Invoke-Checked -Command @($venvPython, $agentPath, "--set-name", $DisplayName)
+    Invoke-HiddenPython -FilePath $venvPythonw -ArgumentList @($agentPath, "--set-name", $DisplayName)
 }
 
 if (-not $SkipStartupTask) {
     Write-Step "Configuring startup entry"
     $env:PCBOT_STARTUP_TASK_NAME = $TaskName
-    Invoke-Checked -Command @($venvPython, $agentPath, "--install-startup")
+    Invoke-HiddenPython -FilePath $venvPythonw -ArgumentList @($agentPath, "--install-startup")
 }
 
 if (-not $SkipLaunch) {
