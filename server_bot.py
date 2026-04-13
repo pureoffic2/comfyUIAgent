@@ -1920,7 +1920,7 @@ def remote_webapp_html(device_name: str) -> str:
         screen.src = url;
         refreshDelay = 450;
         scheduleFrame(refreshDelay);
-        setStatus(`Экран ${screenWidth}x${screenHeight} обновлён`);
+        setStatus(`Экран ${{screenWidth}}x${{screenHeight}} обновлён`);
         setTimeout(() => URL.revokeObjectURL(url), 4000);
       }} catch (error) {{
         refreshDelay = Math.min(refreshDelay + 500, 2500);
