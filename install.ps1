@@ -21,6 +21,38 @@ function Write-Step {
     Write-Host "==> $Message"
 }
 
+function Enable-Tls12IfPossible {
+    try {
+        [System.Net.ServicePointManager]::SecurityProtocol = `
+            [System.Net.ServicePointManager]::SecurityProtocol -bor `
+            [System.Net.SecurityProtocolType]::Tls12
+    }
+    catch {
+    }
+}
+
+function Invoke-Download {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutFile
+    )
+
+    $params = @{
+        Uri     = $Uri
+        OutFile = $OutFile
+    }
+
+    $iwr = Get-Command Invoke-WebRequest -ErrorAction Stop
+    if ($iwr.Parameters.ContainsKey("UseBasicParsing")) {
+        $params.UseBasicParsing = $true
+    }
+
+    Invoke-WebRequest @params
+}
+
 function Resolve-PythonCommand {
     $pyCmd = Get-Command py -ErrorAction SilentlyContinue
     if ($pyCmd) {
@@ -48,6 +80,7 @@ function Invoke-Checked {
     }
 }
 
+Enable-Tls12IfPossible
 $pythonCmd = Resolve-PythonCommand
 $installPath = [System.IO.Path]::GetFullPath($InstallDir)
 $venvPath = Join-Path $installPath ".venv"
@@ -60,7 +93,7 @@ Write-Step "Preparing install folder $installPath"
 New-Item -ItemType Directory -Path $installPath -Force | Out-Null
 
 Write-Step "Downloading agent"
-Invoke-WebRequest -Uri $AgentUrl -OutFile $agentPath -UseBasicParsing
+Invoke-Download -Uri $AgentUrl -OutFile $agentPath
 
 Write-Step "Creating virtual environment"
 Invoke-Checked -Command ($pythonCmd + @("-m", "venv", $venvPath))
@@ -88,7 +121,12 @@ if (-not $SkipLaunch) {
         Start-Process -FilePath $venvPythonw -ArgumentList @($agentPath) -WorkingDirectory $installPath -WindowStyle Hidden
     }
     else {
-        Start-Process -FilePath $venvPython -ArgumentList @($agentPath) -WorkingDirectory $installPath
+        $launchVbs = Join-Path $installPath "launch_hidden.vbs"
+        @"
+Set shell = CreateObject("WScript.Shell")
+shell.Run Chr(34) & "$venvPython" & Chr(34) & " " & Chr(34) & "$agentPath" & Chr(34), 0
+"@ | Set-Content -Path $launchVbs -Encoding Ascii
+        Start-Process -FilePath "wscript.exe" -ArgumentList @($launchVbs) -WindowStyle Hidden
     }
 }
 
@@ -103,6 +141,9 @@ $agentPath
 
 Startup entry:
 $TaskName
+
+Autostart mode:
+per-user hidden logon start
 "@
 $installSummary | Set-Content -Path $readmePath -Encoding UTF8
 

