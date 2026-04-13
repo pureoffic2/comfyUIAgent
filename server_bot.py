@@ -1297,7 +1297,25 @@ async def wifi_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def update_agent_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await run_for_current(update, context, "self_update", use_cache=False)
+    if not await authorize(update) or update.effective_chat is None:
+        return
+    device = await selected_device(update.effective_chat.id)
+    if not device:
+        await send_text(update, context, "ПК не выбран. Сначала открой /pcs.")
+        return
+    result = await run_and_wait(device["device_id"], "self_update")
+    if result is None:
+        await send_text(update, context, "Обновление не подтвердилось: устройство не ответило вовремя.")
+        return
+    payload = result.get("result", {})
+    if not payload.get("ok", False) and "self_update" in str(payload.get("message", "")):
+        await send_text(
+            update,
+            context,
+            "На этом ПК ещё старый агент без self-update. Один раз переустанови его или обнови вручную, и дальше кнопка Update будет работать уже сама с GitHub.",
+        )
+        return
+    await send_result(update, context, "self_update", result)
 
 
 async def text_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
