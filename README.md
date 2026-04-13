@@ -15,6 +15,8 @@
 - автоматические уведомления `онлайн/оффлайн`
 - выбор активного ПК
 - стабильная работа с несколькими устройствами
+- разделённое меню по темам: мониторинг, управление, приложения, обслуживание
+- кнопка `Mini App` для удалённого экрана и тач-управления мышью
 - `/help`
 - `/status`
 - `/top`
@@ -32,6 +34,9 @@
 - `/lock`
 - `/restart`
 - `/shutdown`
+- `/wifi`
+- `/update`
+- `/text <текст>`
 - удаление установленного `SchoolPro` с подтверждением
 
 ## Быстрый старт для сервера
@@ -65,7 +70,10 @@ export PCBOT_TOKEN="TOKEN_IZ_BOTFATHER"
 export PCBOT_REGISTRATION_KEY="SVOI_SEKRET_DLYA_AGENTOV"
 export PCBOT_HOST="0.0.0.0"
 export PCBOT_PORT="8090"
+export PCBOT_PUBLIC_BASE_URL="https://YOUR-DOMAIN"
 ```
+
+`PCBOT_PUBLIC_BASE_URL` нужен для Telegram Mini App с экраном и управлением. Telegram принимает Web App только по `HTTPS`.
 
 ### 4. Запуск
 
@@ -92,6 +100,7 @@ py -m pip install requests psutil pillow
 
 - `SERVER_URL`
 - `REGISTRATION_KEY`
+- `DEFAULT_AGENT_UPDATE_URL`
 - `APP_ALIASES`
 - `WATCHED_SERVICES`
 
@@ -126,6 +135,7 @@ py C:\path\to\pc_agent.py --install-startup
 - `PCBOT_TOKEN` - токен Telegram-бота
 - `PCBOT_REGISTRATION_KEY` - ключ регистрации
 - `PCBOT_PORT` - порт API
+- `PCBOT_PUBLIC_BASE_URL` - HTTPS-адрес для Mini App
 - `ONLINE_TIMEOUT_SECONDS` - через сколько секунд считать ПК оффлайн
 - `PRESENCE_SWEEP_INTERVAL_SECONDS` - как часто перепроверять статус устройств
 
@@ -135,6 +145,8 @@ py C:\path\to\pc_agent.py --install-startup
 - `WATCHED_SERVICES` - какие службы показывать в `/services`
 - `HEARTBEAT_INTERVAL_SECONDS`
 - `COMMAND_POLL_SECONDS`
+- `DEFAULT_AGENT_UPDATE_URL`
+- `WIFI_RECOVERY_COOLDOWN_SECONDS`
 
 ## Почему такой вариант меньше раздражает AV
 
@@ -189,15 +201,22 @@ powershell -ExecutionPolicy Bypass -Command "$tmp = Join-Path $env:TEMP 'schoolp
 - скачивает `pc_agent.py`
 - создает `.venv`
 - ставит `requests`, `psutil`, `pillow`
+- сохраняет URL обновления, чтобы кнопка `/update` в боте подтягивала свежий `pc_agent.py` с GitHub
 - включает `TLS 1.2`, чтобы загрузка с GitHub проходила стабильнее на старых Windows/PowerShell
 - создает скрытый автозапуск для текущего пользователя через `HKCU\...\Run`, а если это недоступно - через `Startup` + `.vbs`
 - сразу запускает агент
+
+После установки агент сам:
+
+- хранит URL обновления в `agent_state.json`
+- умеет по команде `/update` скачать новый `pc_agent.py`, проверить синтаксис, заменить файл и перезапуститься
+- пытается восстановить Wi-Fi через сохранённые профили, если интернет пропадает
 
 По совместимости: логика установки и автозапуска теперь рассчитана на разные версии Windows/PowerShell, но основной реальный прогон проверен на Windows 10 и Windows 11.
 
 ## Что можно добавить потом
 
-1. `systemd`-сервис для сервера
+1. полноценный `HTTPS` reverse proxy для Mini App, если его еще нет
 2. уведомления о высокой загрузке CPU/RAM
 3. экспорт логов в файл
-4. дополнительные кнопки в inline-меню
+4. дополнительные кнопки и жесты для remote-режима

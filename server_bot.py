@@ -12,9 +12,10 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 
@@ -33,6 +34,9 @@ COMMAND_TIMEOUT_SECONDS = int(os.environ.get("PCBOT_COMMAND_TIMEOUT", "35"))
 COMMAND_RESULT_POLL_INTERVAL_SECONDS = float(os.environ.get("PCBOT_COMMAND_POLL_INTERVAL", "0.35"))
 CMD_COMMAND_PREVIEW_CHARS = int(os.environ.get("PCBOT_CMD_COMMAND_PREVIEW", "400"))
 CMD_OUTPUT_PREVIEW_CHARS = int(os.environ.get("PCBOT_CMD_OUTPUT_PREVIEW", "1000"))
+PUBLIC_BASE_URL = os.environ.get("PCBOT_PUBLIC_BASE_URL", "").strip().rstrip("/")
+REMOTE_SESSION_TTL_SECONDS = int(os.environ.get("PCBOT_REMOTE_SESSION_TTL", "43200"))
+REMOTE_FRAME_TIMEOUT_SECONDS = int(os.environ.get("PCBOT_REMOTE_FRAME_TIMEOUT", "25"))
 
 
 def utc_now() -> datetime:
@@ -192,6 +196,14 @@ class CommandResultRequest(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
     file_name: str | None = None
     file_b64: str | None = None
+
+
+class RemoteInputRequest(BaseModel):
+    action: str
+    x: float = 0
+    y: float = 0
+    button: str = "left"
+    delta: int = 0
 
 
 class Store:
@@ -440,9 +452,60 @@ class Store:
             return json.loads(json.dumps(device))
 
 
+class RemoteSessionManager:
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.sessions: dict[str, dict[str, Any]] = {}
+
+    async def create(self, chat_id: int, device_id: str) -> str:
+        async with self.lock:
+            token = secrets.token_urlsafe(24)
+            self.sessions[token] = {
+                "chat_id": int(chat_id),
+                "device_id": device_id,
+                "created_at": utc_now().isoformat(),
+                "expires_at": (utc_now() + timedelta(seconds=REMOTE_SESSION_TTL_SECONDS)).isoformat(),
+            }
+            return token
+
+    async def get(self, token: str) -> dict[str, Any] | None:
+        async with self.lock:
+            session = self.sessions.get(token)
+            if not session:
+                return None
+            try:
+                expires_at = datetime.fromisoformat(str(session.get("expires_at")))
+            except ValueError:
+                expires_at = utc_now()
+            if utc_now() >= expires_at:
+                self.sessions.pop(token, None)
+                return None
+            session["expires_at"] = (utc_now() + timedelta(seconds=REMOTE_SESSION_TTL_SECONDS)).isoformat()
+            return json.loads(json.dumps(session))
+
+    async def sweep(self) -> None:
+        async with self.lock:
+            now = utc_now()
+            expired = []
+            for token, session in self.sessions.items():
+                try:
+                    expires_at = datetime.fromisoformat(str(session.get("expires_at")))
+                except ValueError:
+                    expires_at = now
+                if now >= expires_at:
+                    expired.append(token)
+            for token in expired:
+                self.sessions.pop(token, None)
+
+
 store = Store(STATE_PATH)
+remote_sessions = RemoteSessionManager()
 api = FastAPI(title="Safe Telegram PC Bot")
 telegram_app: Application | None = None
+
+
+def status_icon(device: dict[str, Any]) -> str:
+    return "🟢" if is_online(device) else "⚫"
 
 
 def device_card(device: dict[str, Any]) -> str:
@@ -452,13 +515,16 @@ def device_card(device: dict[str, Any]) -> str:
     lines = [
         "<b>SchoolPro</b>",
         f"<b>{html.escape(device.get('display_name', device['device_id']))}</b>",
-        f"<b>Статус</b>: <code>{status_badge(device)}</code> | {html.escape(status_label(device))}",
+        f"<b>Статус</b>: {html.escape(status_icon(device))} <code>{status_badge(device)}</code> | {html.escape(status_label(device))}",
         f"<b>ID</b>: <code>{html.escape(device.get('device_id', 'n/a'))}</code>",
         f"<b>Heartbeat</b>: {html.escape(format_time(last_seen))} | {html.escape(format_relative_age(last_seen))}",
         f"<b>Версия агента</b>: <code>{html.escape(str(device.get('agent_version', 'n/a')))}</code>",
         f"<b>Команды</b>: <code>{counters['queued']}</code> в очереди | <code>{counters['in_progress']}</code> выполняется",
     ]
     if snapshot:
+        wifi_profile = snapshot.get("wifi_profile") or "н/д"
+        wifi_signal = snapshot.get("wifi_signal")
+        wifi_line = wifi_profile if wifi_signal is None else f"{wifi_profile} ({wifi_signal}%)"
         lines.extend(
             [
                 "",
@@ -470,6 +536,8 @@ def device_card(device: dict[str, Any]) -> str:
                 f"<b>CPU</b>: <code>{snapshot.get('cpu_percent', 'n/a')}%</code>",
                 f"<b>RAM</b>: <code>{snapshot.get('memory_percent', 'n/a')}%</code>",
                 f"<b>Диск</b>: <code>{snapshot.get('disk_percent', 'n/a')}%</code>",
+                f"<b>Wi-Fi</b>: <code>{html.escape(str(wifi_line))}</code>",
+                f"<b>Интернет</b>: <code>{'OK' if snapshot.get('internet_ok') else 'NO'}</code>",
                 f"<b>Сеть</b>: <code>{format_bytes(snapshot.get('net_down_per_sec'))}/с</code> вниз | "
                 f"<code>{format_bytes(snapshot.get('net_up_per_sec'))}/с</code> вверх",
             ]
@@ -507,13 +575,20 @@ def snapshot_text(device: dict[str, Any], command_type: str) -> str | None:
             f"CPU: {snapshot.get('cpu_percent', 'н/д')}%\n"
             f"RAM: {snapshot.get('memory_percent', 'н/д')}%\n"
             f"Диск: {snapshot.get('disk_percent', 'н/д')}%\n"
-            f"IP: {', '.join(snapshot.get('ip_addresses', [])) or 'н/д'}"
+            f"IP: {', '.join(snapshot.get('ip_addresses', [])) or 'н/д'}\n"
+            f"Wi-Fi: {snapshot.get('wifi_profile') or 'н/д'}\n"
+            f"Интернет: {'ok' if snapshot.get('internet_ok') else 'нет'}"
         )
     if command_type == "uptime":
         return f"Аптайм: {format_duration(snapshot.get('uptime_seconds'))}\nОбновлено: {updated_at}"
     if command_type == "net":
+        wifi_profile = snapshot.get("wifi_profile") or "н/д"
+        wifi_signal = snapshot.get("wifi_signal")
+        wifi_suffix = f" ({wifi_signal}%)" if wifi_signal is not None else ""
         return (
             f"IP: {', '.join(snapshot.get('ip_addresses', [])) or 'н/д'}\n"
+            f"Wi-Fi: {wifi_profile}{wifi_suffix}\n"
+            f"Интернет: {'ok' if snapshot.get('internet_ok') else 'нет'}\n"
             f"Скачивание: {format_bytes(snapshot.get('net_down_per_sec'))}/с\n"
             f"Отдача: {format_bytes(snapshot.get('net_up_per_sec'))}/с\n"
             f"Обновлено: {updated_at}"
@@ -542,7 +617,7 @@ def help_text() -> str:
         "/pcs - список устройств и их статус\n"
         "/select <name_or_id> - выбрать активный ПК\n"
         "/status - подробная карточка выбранного ПК\n"
-        "/menu - кнопки управления\n\n"
+        "/menu - главное меню выбранного ПК\n\n"
         "Мониторинг\n\n"
         "/info - сводка по системе\n"
         "/uptime - аптайм\n"
@@ -562,58 +637,135 @@ def help_text() -> str:
         "/lock - заблокировать ПК\n"
         "/restart - перезагрузить ПК\n"
         "/shutdown - выключить ПК\n\n"
-        "Уведомления об онлайне и оффлайне приходят автоматически. Удаление SchoolPro доступно из карточки устройства и требует подтверждения."
+        "Обслуживание\n\n"
+        "/wifi - вручную попросить агент переподключить Wi-Fi\n"
+        "/update - обновить агент с GitHub\n"
+        "/text <текст> - показать отдельное окно с текстом на экране ПК\n\n"
+        "Уведомления об онлайне и оффлайне приходят автоматически. Mini App удалённого экрана доступен из главного меню выбранного ПК, если сервер открыт по HTTPS через PCBOT_PUBLIC_BASE_URL."
     )
 
 
-def devices_keyboard(devices: list[dict[str, Any]]) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton(
-                f"{index}. {device['display_name']} [{status_badge(device)}]",
-                callback_data=f"select:{device['device_id']}",
-            )
-        ]
-        for index, device in enumerate(devices, start=1)
-    ]
+def devices_keyboard(devices: list[dict[str, Any]], current_id: str | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for device in devices:
+        prefix = "⭐ " if current_id and current_id == device["device_id"] else ""
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{prefix}{status_icon(device)} {device['display_name']}",
+                    callback_data=f"select:{device['device_id']}",
+                )
+            ]
+        )
     if not rows:
         rows = [[InlineKeyboardButton("Пока нет устройств", callback_data="noop")]]
     return InlineKeyboardMarkup(rows)
 
 
-def menu_keyboard() -> InlineKeyboardMarkup:
+def public_remote_supported() -> bool:
+    return PUBLIC_BASE_URL.startswith("https://")
+
+
+def device_home_text(device: dict[str, Any]) -> str:
+    return (
+        "<b>Панель ПК</b>\n"
+        f"ПК: <b>{html.escape(device.get('display_name', device['device_id']))}</b>\n"
+        f"Статус: {html.escape(status_icon(device))} <code>{status_badge(device)}</code>\n"
+        f"Heartbeat: {html.escape(format_relative_age(device.get('last_seen')))}\n\n"
+        "Выбери раздел ниже."
+    )
+
+
+def root_menu_keyboard(remote_url: str | None) -> InlineKeyboardMarkup:
+    remote_button: InlineKeyboardButton
+    if remote_url:
+        remote_button = InlineKeyboardButton("🕹 Remote", web_app=WebAppInfo(url=remote_url))
+    else:
+        remote_button = InlineKeyboardButton("🕹 Remote", callback_data="action:remote_unavailable")
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Карточка", callback_data="action:status"),
-                InlineKeyboardButton("Скриншот", callback_data="action:screenshot"),
+                InlineKeyboardButton("🖥 Карточка", callback_data="action:status"),
+                remote_button,
             ],
             [
-                InlineKeyboardButton("Система", callback_data="action:info"),
-                InlineKeyboardButton("Аптайм", callback_data="action:uptime"),
-                InlineKeyboardButton("Сеть", callback_data="action:net"),
+                InlineKeyboardButton("📊 Мониторинг", callback_data="action:section:monitor"),
+                InlineKeyboardButton("⚙️ Управление", callback_data="action:section:control"),
             ],
             [
-                InlineKeyboardButton("Диски", callback_data="action:drives"),
-                InlineKeyboardButton("Окна", callback_data="action:apps"),
-                InlineKeyboardButton("Процессы", callback_data="action:top"),
+                InlineKeyboardButton("🚀 Приложения", callback_data="action:section:apps"),
+                InlineKeyboardButton("🛠 Обслуживание", callback_data="action:section:maintenance"),
             ],
             [
-                InlineKeyboardButton("Службы", callback_data="action:services"),
-                InlineKeyboardButton("Джобы", callback_data="action:jobs"),
+                InlineKeyboardButton("💻 Список ПК", callback_data="action:pcs"),
+                InlineKeyboardButton("❓ Помощь", callback_data="action:help"),
+            ],
+        ]
+    )
+
+
+def monitor_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📷 Скрин", callback_data="action:screenshot"),
+                InlineKeyboardButton("ℹ️ Система", callback_data="action:info"),
             ],
             [
-                InlineKeyboardButton("Список ПК", callback_data="action:pcs"),
-                InlineKeyboardButton("Помощь", callback_data="action:help"),
+                InlineKeyboardButton("⏱ Аптайм", callback_data="action:uptime"),
+                InlineKeyboardButton("🌐 Сеть", callback_data="action:net"),
             ],
             [
-                InlineKeyboardButton("Блок", callback_data="action:lock"),
-                InlineKeyboardButton("Рестарт", callback_data="action:restart"),
+                InlineKeyboardButton("💾 Диски", callback_data="action:drives"),
+                InlineKeyboardButton("🧩 Службы", callback_data="action:services"),
             ],
             [
-                InlineKeyboardButton("Выкл", callback_data="action:shutdown"),
-                InlineKeyboardButton("Удалить", callback_data="action:delete_prompt"),
+                InlineKeyboardButton("🪟 Окна", callback_data="action:apps"),
+                InlineKeyboardButton("📈 Процессы", callback_data="action:top"),
             ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="action:menu_root")],
+        ]
+    )
+
+
+def control_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🔒 Блок", callback_data="action:lock"),
+                InlineKeyboardButton("🔁 Рестарт", callback_data="action:restart"),
+            ],
+            [
+                InlineKeyboardButton("⛔ Выключить", callback_data="action:shutdown"),
+                InlineKeyboardButton("💬 /text", callback_data="action:text_help"),
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="action:menu_root")],
+        ]
+    )
+
+
+def apps_section_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🪟 Окна", callback_data="action:apps"),
+                InlineKeyboardButton("📈 Процессы", callback_data="action:top"),
+            ],
+            [InlineKeyboardButton("⚡ Джобы", callback_data="action:jobs")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="action:menu_root")],
+        ]
+    )
+
+
+def maintenance_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📶 Wi-Fi", callback_data="action:wifi"),
+                InlineKeyboardButton("♻️ Update", callback_data="action:update"),
+            ],
+            [InlineKeyboardButton("🗑 Удалить", callback_data="action:delete_prompt")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="action:menu_root")],
         ]
     )
 
@@ -622,7 +774,7 @@ def delete_confirm_keyboard(device_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Удалить с ПК", callback_data=f"delete:confirm:{device_id}")],
-            [InlineKeyboardButton("Назад", callback_data="action:status")],
+            [InlineKeyboardButton("Назад", callback_data="action:section:maintenance")],
         ]
     )
 
@@ -741,6 +893,37 @@ async def selected_device(chat_id: int, explicit: str | None = None) -> dict[str
     return None
 
 
+async def build_remote_url(chat_id: int, device_id: str) -> str | None:
+    if not public_remote_supported():
+        return None
+    token = await remote_sessions.create(chat_id, device_id)
+    return f"{PUBLIC_BASE_URL}/remote/{token}"
+
+
+async def root_menu_markup(chat_id: int, device_id: str) -> InlineKeyboardMarkup:
+    return root_menu_keyboard(await build_remote_url(chat_id, device_id))
+
+
+async def show_device_root(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    device: dict[str, Any],
+) -> None:
+    if update.effective_chat is None:
+        return
+    await send_text(
+        update,
+        context,
+        device_home_text(device),
+        reply_markup=await root_menu_markup(update.effective_chat.id, device["device_id"]),
+        parse_mode="HTML",
+    )
+
+
+def section_text(title: str, description: str) -> str:
+    return f"<b>{html.escape(title)}</b>\n{html.escape(description)}"
+
+
 def extract_command_text(update: Update) -> str:
     message = update.effective_message
     if message is None:
@@ -796,9 +979,14 @@ def format_shell_result_html(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-async def run_and_wait(device_id: str, command_type: str, args: dict[str, Any] | None = None) -> dict[str, Any] | None:
+async def run_and_wait(
+    device_id: str,
+    command_type: str,
+    args: dict[str, Any] | None = None,
+    timeout_seconds: int | float | None = None,
+) -> dict[str, Any] | None:
     queued = await store.queue_command(device_id, command_type, args)
-    deadline = asyncio.get_running_loop().time() + COMMAND_TIMEOUT_SECONDS
+    deadline = asyncio.get_running_loop().time() + float(timeout_seconds or COMMAND_TIMEOUT_SECONDS)
     while asyncio.get_running_loop().time() < deadline:
         current = await store.get_command(device_id, queued["id"])
         if current and current.get("status") in {"completed", "failed"}:
@@ -895,6 +1083,7 @@ async def run_for_current(
     context: ContextTypes.DEFAULT_TYPE,
     command_type: str,
     args: dict[str, Any] | None = None,
+    use_cache: bool = True,
 ) -> None:
     if not await authorize(update):
         return
@@ -904,8 +1093,8 @@ async def run_for_current(
     if not device:
         await send_text(update, context, "ПК не выбран. Сначала открой /pcs.")
         return
-    cached = snapshot_text(device, command_type)
-    if cached is not None:
+    cached = snapshot_text(device, command_type) if use_cache else None
+    if use_cache and cached is not None:
         await send_text(update, context, cached)
         return
     result = await run_and_wait(device["device_id"], command_type, args)
@@ -944,7 +1133,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if update.effective_chat is None or update.effective_message is None:
         return
     await store.claim_owner(update.effective_chat.id)
-    await update.effective_message.reply_text("Бот активен. Открой /pcs и выбери устройство.")
+    await update.effective_message.reply_text("Бот активен. Открой /pcs, выбери ПК и дальше работай через разделы меню.")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -967,13 +1156,16 @@ async def pcs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if devices:
         body += "\n".join(
             f"{'•' if current and current['device_id'] == device['device_id'] else '·'} "
-            f"<b>{html.escape(device['display_name'])}</b> | <code>{status_badge(device)}</code> | "
+            f"{html.escape(status_icon(device))} <b>{html.escape(device['display_name'])}</b> | <code>{status_badge(device)}</code> | "
             f"{html.escape(format_relative_age(device.get('last_seen')))} | <code>{html.escape(device['device_id'])}</code>"
             for device in devices
         )
     else:
         body += "Пока нет подключённых агентов."
-    await update.effective_message.reply_html(body, reply_markup=devices_keyboard(devices))
+    await update.effective_message.reply_html(
+        body,
+        reply_markup=devices_keyboard(devices, current["device_id"] if current else None),
+    )
 
 
 async def select_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -984,13 +1176,13 @@ async def select_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not current:
             await update.effective_message.reply_text("ПК не выбран. Сначала открой /pcs.")
             return
-        await update.effective_message.reply_html(device_card(current), reply_markup=menu_keyboard())
+        await show_device_root(update, context, current)
         return
     current = await selected_device(update.effective_chat.id, " ".join(context.args))
     if not current:
         await update.effective_message.reply_text("ПК не найден.")
         return
-    await update.effective_message.reply_html(device_card(current), reply_markup=menu_keyboard())
+    await show_device_root(update, context, current)
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1000,7 +1192,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not current:
         await update.effective_message.reply_text("ПК не выбран. Сначала открой /pcs.")
         return
-    await update.effective_message.reply_html(device_card(current), reply_markup=menu_keyboard())
+    await update.effective_message.reply_html(
+        device_card(current),
+        reply_markup=await root_menu_markup(update.effective_chat.id, current["device_id"]),
+    )
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1010,12 +1205,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not current:
         await update.effective_message.reply_text("Сначала выбери ПК через /pcs.")
         return
-    await update.effective_message.reply_html(
-        "<b>Панель управления</b>\n"
-        f"ПК: <b>{html.escape(current['display_name'])}</b>\n"
-        f"Статус: <code>{status_badge(current)}</code> | {html.escape(format_relative_age(current.get('last_seen')))}",
-        reply_markup=menu_keyboard(),
-    )
+    await show_device_root(update, context, current)
 
 
 async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1102,6 +1292,23 @@ async def shutdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await run_for_current(update, context, "shutdown_pc")
 
 
+async def wifi_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await run_for_current(update, context, "wifi_recover", use_cache=False)
+
+
+async def update_agent_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await run_for_current(update, context, "self_update", use_cache=False)
+
+
+async def text_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text_value = extract_command_text(update)
+    if not text_value:
+        if update.effective_message:
+            await update.effective_message.reply_text("Использование: /text <текст>")
+        return
+    await run_for_current(update, context, "show_text", {"text": text_value}, use_cache=False)
+
+
 async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         if update.effective_message:
@@ -1169,13 +1376,64 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.message.reply_text("ПК не найден.")
             return
         await store.set_selected(update.effective_chat.id, device_id)
-        await query.message.reply_html(device_card(device), reply_markup=menu_keyboard())
+        await send_text(
+            update,
+            context,
+            device_home_text(device),
+            reply_markup=await root_menu_markup(update.effective_chat.id, device_id),
+            parse_mode="HTML",
+        )
         return
     if data == "action:pcs":
         await pcs_command(update, context)
         return
     if data == "action:help":
         await query.message.reply_text(help_text())
+        return
+    if data == "action:menu_root":
+        current = await selected_device(update.effective_chat.id)
+        if not current:
+            await query.message.reply_text("Сначала выбери устройство через /pcs.")
+            return
+        await send_text(
+            update,
+            context,
+            device_home_text(current),
+            reply_markup=await root_menu_markup(update.effective_chat.id, current["device_id"]),
+            parse_mode="HTML",
+        )
+        return
+    if data == "action:remote_unavailable":
+        await query.message.reply_text(
+            "Mini App появится тут, когда сервер будет доступен по HTTPS и будет задан PCBOT_PUBLIC_BASE_URL."
+        )
+        return
+    if data == "action:text_help":
+        await query.message.reply_text("Использование: /text <текст>")
+        return
+    if data == "action:section:monitor":
+        await query.message.reply_html(
+            section_text("Мониторинг", "Система, сеть, скриншоты и процессы выбранного ПК."),
+            reply_markup=monitor_keyboard(),
+        )
+        return
+    if data == "action:section:control":
+        await query.message.reply_html(
+            section_text("Управление", "Блокировка, рестарт, выключение и показ текста на экране."),
+            reply_markup=control_keyboard(),
+        )
+        return
+    if data == "action:section:apps":
+        await query.message.reply_html(
+            section_text("Приложения", "Окна, процессы и джобы выбранного ПК."),
+            reply_markup=apps_section_keyboard(),
+        )
+        return
+    if data == "action:section:maintenance":
+        await query.message.reply_html(
+            section_text("Обслуживание", "Wi-Fi recovery, update агента и удаление установки."),
+            reply_markup=maintenance_keyboard(),
+        )
         return
     if data == "action:delete_prompt":
         current = await selected_device(update.effective_chat.id)
@@ -1228,6 +1486,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "action:lock": lock_command,
         "action:restart": restart_command,
         "action:shutdown": shutdown_command,
+        "action:wifi": wifi_command,
+        "action:update": update_agent_command,
     }
     handler = mapping.get(data)
     if handler:
@@ -1236,9 +1496,341 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def notifier_loop() -> None:
     while True:
+        await remote_sessions.sweep()
         for device in await store.sweep_presence():
             await notify_owner(f"{device['display_name']} теперь оффлайн. Heartbeat не приходил дольше таймаута.")
         await asyncio.sleep(PRESENCE_SWEEP_INTERVAL_SECONDS)
+
+
+def remote_webapp_html(device_name: str) -> str:
+    safe_name = html.escape(device_name)
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>Remote {safe_name}</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {{
+      --bg: #07111f;
+      --panel: rgba(10, 24, 41, 0.88);
+      --text: #ecfeff;
+      --muted: #94a3b8;
+      --accent: #22d3ee;
+      --accent2: #38bdf8;
+      --danger: #fb7185;
+      --ok: #34d399;
+      --border: rgba(148, 163, 184, 0.2);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at top left, rgba(34, 211, 238, 0.18), transparent 32%),
+        radial-gradient(circle at top right, rgba(59, 130, 246, 0.22), transparent 30%),
+        linear-gradient(180deg, #020617, #07111f 58%, #020617);
+      color: var(--text);
+      font-family: "Segoe UI", sans-serif;
+      padding: 14px;
+    }}
+    .shell {{
+      max-width: 980px;
+      margin: 0 auto;
+      display: grid;
+      gap: 14px;
+    }}
+    .panel {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      backdrop-filter: blur(14px);
+      box-shadow: 0 20px 50px rgba(2, 6, 23, 0.35);
+      overflow: hidden;
+    }}
+    .hero {{
+      padding: 18px 18px 8px;
+    }}
+    .hero h1 {{
+      margin: 0 0 6px;
+      font-size: 24px;
+    }}
+    .hero p {{
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }}
+    .stage {{
+      position: relative;
+      min-height: 46vh;
+      background: rgba(2, 6, 23, 0.84);
+      touch-action: none;
+      user-select: none;
+    }}
+    .stage img {{
+      display: block;
+      width: 100%;
+      height: auto;
+      max-height: 70vh;
+      object-fit: contain;
+      background: #020617;
+    }}
+    .overlay {{
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      font-size: 15px;
+      background: linear-gradient(180deg, rgba(2, 6, 23, 0.08), rgba(2, 6, 23, 0.5));
+      pointer-events: none;
+    }}
+    .controls {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      padding: 14px;
+    }}
+    button {{
+      border: 0;
+      border-radius: 16px;
+      padding: 14px 16px;
+      color: #06121f;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      font-size: 15px;
+      font-weight: 700;
+    }}
+    button.alt {{
+      color: var(--text);
+      background: rgba(15, 23, 42, 0.88);
+      border: 1px solid var(--border);
+    }}
+    button.warn {{
+      color: #fff1f2;
+      background: linear-gradient(135deg, #e11d48, var(--danger));
+    }}
+    button.active {{
+      outline: 2px solid var(--ok);
+      box-shadow: 0 0 0 4px rgba(52, 211, 153, 0.16);
+    }}
+    .status {{
+      padding: 0 18px 18px;
+      color: var(--muted);
+      font-size: 14px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="panel hero">
+      <h1>Remote {safe_name}</h1>
+      <p>Тап = левый клик. Перетаскивание работает в режиме Drag.</p>
+    </section>
+    <section class="panel">
+      <div id="stage" class="stage">
+        <img id="screen" alt="screen">
+        <div id="overlay" class="overlay">Загружаю экран...</div>
+      </div>
+      <div class="controls">
+        <button id="refresh">Обновить экран</button>
+        <button id="rightClick" class="alt">Правый клик</button>
+        <button id="dragMode" class="alt">Drag off</button>
+        <button id="wheelDown" class="warn">Скролл вниз</button>
+      </div>
+      <div id="status" class="status">Подключение...</div>
+    </section>
+  </div>
+  <script>
+    const tg = window.Telegram?.WebApp;
+    tg?.ready();
+    tg?.expand();
+    const screen = document.getElementById("screen");
+    const stage = document.getElementById("stage");
+    const overlay = document.getElementById("overlay");
+    const statusEl = document.getElementById("status");
+    const basePath = window.location.pathname.replace(/\\/$/, "");
+    const refreshButton = document.getElementById("refresh");
+    const rightClickButton = document.getElementById("rightClick");
+    const dragButton = document.getElementById("dragMode");
+    const wheelDownButton = document.getElementById("wheelDown");
+    let screenWidth = 1;
+    let screenHeight = 1;
+    let dragMode = false;
+    let dragHeld = false;
+    let pointerStart = null;
+    let lastMoveAt = 0;
+    let rightClickNext = false;
+    function setStatus(text) {{
+      statusEl.textContent = text;
+    }}
+    function api(path, options) {{
+      return fetch(`${{basePath}}${{path}}`, Object.assign({{ cache: "no-store" }}, options || {{}}));
+    }}
+    function localToRemote(event) {{
+      const rect = screen.getBoundingClientRect();
+      const x = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
+      const y = Math.max(0, Math.min(rect.height, event.clientY - rect.top));
+      return {{
+        x: Math.round((x / Math.max(rect.width, 1)) * screenWidth),
+        y: Math.round((y / Math.max(rect.height, 1)) * screenHeight),
+      }};
+    }}
+    async function sendInput(payload) {{
+      await api("/api/input", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify(payload),
+      }});
+    }}
+    async function loadFrame() {{
+      overlay.style.display = "grid";
+      try {{
+        const response = await api("/api/frame");
+        if (!response.ok) {{
+          const data = await response.json().catch(() => ({{ detail: "Ошибка кадра" }}));
+          throw new Error(data.detail || "Ошибка кадра");
+        }}
+        screenWidth = Number(response.headers.get("X-Screen-Width") || 1);
+        screenHeight = Number(response.headers.get("X-Screen-Height") || 1);
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        screen.src = url;
+        setStatus(`Экран ${screenWidth}x${screenHeight} обновлён`);
+        setTimeout(() => URL.revokeObjectURL(url), 4000);
+      }} catch (error) {{
+        setStatus(error.message || "Не удалось получить экран");
+      }} finally {{
+        overlay.style.display = "none";
+      }}
+    }}
+    refreshButton.addEventListener("click", () => {{
+      loadFrame();
+    }});
+    rightClickButton.addEventListener("click", () => {{
+      rightClickNext = true;
+      setStatus("Следующий тап будет правым кликом");
+    }});
+    dragButton.addEventListener("click", () => {{
+      dragMode = !dragMode;
+      dragButton.classList.toggle("active", dragMode);
+      dragButton.textContent = dragMode ? "Drag on" : "Drag off";
+      if (!dragMode && dragHeld) {{
+        dragHeld = false;
+      }}
+    }});
+    wheelDownButton.addEventListener("click", async () => {{
+      await sendInput({{ action: "scroll", x: screenWidth / 2, y: screenHeight / 2, delta: -120 }});
+      setStatus("Скролл вниз отправлен");
+    }});
+    stage.addEventListener("pointerdown", async (event) => {{
+      if (!screen.src) return;
+      stage.setPointerCapture(event.pointerId);
+      pointerStart = {{ ...localToRemote(event), moved: false }};
+      if (dragMode) {{
+        dragHeld = true;
+        await sendInput({{ action: "button_down", ...pointerStart }});
+      }}
+    }});
+    stage.addEventListener("pointermove", async (event) => {{
+      if (!pointerStart) return;
+      const now = Date.now();
+      if (now - lastMoveAt < 90) return;
+      lastMoveAt = now;
+      const point = localToRemote(event);
+      pointerStart.moved = true;
+      await sendInput({{ action: "move", ...point }});
+    }});
+    async function finishPointer(event) {{
+      if (!pointerStart) return;
+      const point = localToRemote(event);
+      if (dragMode && dragHeld) {{
+        dragHeld = false;
+        await sendInput({{ action: "button_up", ...point }});
+        setStatus("Drag отправлен");
+      }} else if (rightClickNext) {{
+        rightClickNext = false;
+        await sendInput({{ action: "click", ...point, button: "right" }});
+        setStatus("Правый клик отправлен");
+      }} else {{
+        await sendInput({{ action: "click", ...point, button: "left" }});
+        setStatus("Клик отправлен");
+      }}
+      pointerStart = null;
+      setTimeout(loadFrame, 250);
+    }}
+    stage.addEventListener("pointerup", finishPointer);
+    stage.addEventListener("pointercancel", finishPointer);
+    loadFrame();
+  </script>
+</body>
+</html>"""
+
+
+@api.get("/remote/{session_id}", response_class=HTMLResponse)
+async def remote_webapp(session_id: str) -> HTMLResponse:
+    session = await remote_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="remote session expired")
+    device = await store.get_device(str(session.get("device_id")))
+    if not device:
+        raise HTTPException(status_code=404, detail="device not found")
+    return HTMLResponse(remote_webapp_html(str(device.get("display_name", device["device_id"]))))
+
+
+@api.get("/remote/{session_id}/api/frame")
+async def remote_frame(session_id: str) -> Response:
+    session = await remote_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="remote session expired")
+    device = await store.get_device(str(session.get("device_id")))
+    if not device:
+        raise HTTPException(status_code=404, detail="device not found")
+    if not is_online(device):
+        raise HTTPException(status_code=409, detail="device offline")
+    result = await run_and_wait(device["device_id"], "remote_frame", timeout_seconds=REMOTE_FRAME_TIMEOUT_SECONDS)
+    if result is None:
+        raise HTTPException(status_code=504, detail="device did not return a frame in time")
+    payload = result.get("result", {})
+    if not payload.get("ok", False):
+        raise HTTPException(status_code=500, detail=str(payload.get("message") or "frame failed"))
+    file_path = payload.get("file_path")
+    if not file_path or not Path(file_path).exists():
+        raise HTTPException(status_code=500, detail="frame file missing")
+    data = payload.get("data", {})
+    return Response(
+        content=Path(file_path).read_bytes(),
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Screen-Width": str(data.get("screen_width", "")),
+            "X-Screen-Height": str(data.get("screen_height", "")),
+        },
+    )
+
+
+@api.post("/remote/{session_id}/api/input")
+async def remote_input(session_id: str, payload: RemoteInputRequest) -> dict[str, Any]:
+    session = await remote_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="remote session expired")
+    device = await store.get_device(str(session.get("device_id")))
+    if not device:
+        raise HTTPException(status_code=404, detail="device not found")
+    if not is_online(device):
+        raise HTTPException(status_code=409, detail="device offline")
+    command = await store.queue_command(
+        device["device_id"],
+        "remote_input",
+        {
+            "action": payload.action,
+            "x": payload.x,
+            "y": payload.y,
+            "button": payload.button,
+            "delta": payload.delta,
+        },
+    )
+    return {"ok": True, "command_id": command["id"]}
 
 
 @api.post("/api/register")
@@ -1294,6 +1886,9 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("lock", lock_command))
     app.add_handler(CommandHandler("restart", restart_command))
     app.add_handler(CommandHandler("shutdown", shutdown_command))
+    app.add_handler(CommandHandler("wifi", wifi_command))
+    app.add_handler(CommandHandler("update", update_agent_command))
+    app.add_handler(CommandHandler("text", text_command))
     app.add_handler(CommandHandler("cmd", cmd_command))
     app.add_handler(CommandHandler("run", run_command))
     app.add_handler(CommandHandler("job", job_command))

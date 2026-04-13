@@ -104,6 +104,9 @@ Invoke-Checked -Command @($venvPython, "-m", "pip", "install", "--upgrade", "pip
 Write-Step "Installing dependencies"
 Invoke-Checked -Command @($venvPython, "-m", "pip", "install", "requests", "psutil", "pillow")
 
+Write-Step "Saving update source"
+Invoke-Checked -Command @($venvPython, $agentPath, "--set-update-url", $AgentUrl)
+
 if ($DisplayName.Trim()) {
     Write-Step "Setting device name"
     Invoke-Checked -Command @($venvPython, $agentPath, "--set-name", $DisplayName)
@@ -144,6 +147,9 @@ $TaskName
 
 Autostart mode:
 per-user hidden logon start
+
+Update URL:
+$AgentUrl
 "@
 $installSummary | Set-Content -Path $readmePath -Encoding UTF8
 

