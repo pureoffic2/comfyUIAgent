@@ -44,7 +44,7 @@ REGISTRATION_KEY = os.environ.get("PCBOT_REGISTRATION_KEY", "change-this-key").s
 HEARTBEAT_INTERVAL_SECONDS = max(5, int(os.environ.get("PCBOT_HEARTBEAT_INTERVAL", "10")))
 COMMAND_POLL_SECONDS = max(1, int(os.environ.get("PCBOT_COMMAND_POLL", "1")))
 HTTP_TIMEOUT_SECONDS = max(5, int(os.environ.get("PCBOT_HTTP_TIMEOUT", "15")))
-AGENT_VERSION = "1.1.0"
+AGENT_VERSION = "1.1.1"
 SHELL_COMMAND_TIMEOUT_SECONDS = 25
 SHELL_COMMAND_CWD = str(Path.home())
 SHELL_COMMAND_PREVIEW_CHARS = 1600
@@ -159,6 +159,53 @@ def startup_vbs_path(entry_name: str | None = None) -> Path:
 def legacy_startup_cmd_path(entry_name: str | None = None) -> Path:
     entry = entry_name or startup_entry_name()
     return appdata_roaming_dir() / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / f"{entry}.cmd"
+
+
+def autostart_scan_patterns() -> tuple[str, ...]:
+    return (
+        "SchoolPro*.cmd",
+        "SchoolPro*.vbs",
+        "SafePc*.cmd",
+        "SafePc*.vbs",
+    )
+
+
+def startup_dir() -> Path:
+    return appdata_roaming_dir() / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+
+
+def cleanup_legacy_startup_files() -> None:
+    base = startup_dir()
+    if not base.exists():
+        return
+    for pattern in autostart_scan_patterns():
+        for candidate in base.glob(pattern):
+            if not candidate.is_file():
+                continue
+            text = ""
+            with contextlib.suppress(OSError):
+                text = candidate.read_text(encoding="utf-8", errors="ignore").lower()
+            if "pc_agent.py" not in text and "schoolpro" not in candidate.name.lower() and "safepc" not in candidate.name.lower():
+                continue
+            with contextlib.suppress(FileNotFoundError):
+                candidate.unlink()
+
+
+def cleanup_legacy_scheduled_tasks() -> None:
+    task_names = {
+        DEFAULT_STARTUP_ENTRY_NAME,
+        *LEGACY_STARTUP_ENTRY_NAMES,
+        "SchoolProAgentTest",
+        "SchoolProAgentTest2",
+    }
+    for task_name in task_names:
+        subprocess.run(
+            ["schtasks", "/Delete", "/TN", task_name, "/F"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
 
 
 def get_ip_addresses() -> list[str]:
@@ -759,6 +806,9 @@ def install_startup_task() -> None:
     entry_name = startup_entry_name()
     mode = "startup_vbs"
 
+    cleanup_legacy_scheduled_tasks()
+    cleanup_legacy_startup_files()
+
     if pythonw_exe.exists():
         command_line = f'"{pythonw_exe}" "{script_path}"'
         if install_registry_run_entry(entry_name, command_line):
@@ -787,6 +837,8 @@ def remove_startup_entry() -> None:
         *LEGACY_STARTUP_ENTRY_NAMES,
     }
 
+    cleanup_legacy_scheduled_tasks()
+
     if "winreg" in globals():
         with contextlib.suppress(OSError):
             with winreg.OpenKey(
@@ -804,6 +856,7 @@ def remove_startup_entry() -> None:
             startup_vbs_path(entry_name).unlink()
         with contextlib.suppress(FileNotFoundError):
             legacy_startup_cmd_path(entry_name).unlink()
+    cleanup_legacy_startup_files()
 
 
 def managed_install_dir() -> bool:
@@ -813,8 +866,17 @@ def managed_install_dir() -> bool:
 def build_self_uninstall_script(entry_name: str, target_dir: Path) -> Path:
     cleanup_names = [entry_name, DEFAULT_STARTUP_ENTRY_NAME, *LEGACY_STARTUP_ENTRY_NAMES]
     cleanup_commands = [f'reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "{name}" /f >nul 2>&1' for name in cleanup_names]
+    cleanup_commands.extend(f'schtasks /Delete /TN "{name}" /F >nul 2>&1' for name in cleanup_names)
     cleanup_commands.extend(f'del "{startup_vbs_path(name)}" >nul 2>&1' for name in cleanup_names)
     cleanup_commands.extend(f'del "{legacy_startup_cmd_path(name)}" >nul 2>&1' for name in cleanup_names)
+    cleanup_commands.extend(
+        [
+            f'del "{startup_dir()}\\SchoolPro*.cmd" >nul 2>&1',
+            f'del "{startup_dir()}\\SchoolPro*.vbs" >nul 2>&1',
+            f'del "{startup_dir()}\\SafePc*.cmd" >nul 2>&1',
+            f'del "{startup_dir()}\\SafePc*.vbs" >nul 2>&1',
+        ]
+    )
     cleanup_script = Path(tempfile.gettempdir()) / f"schoolpro_cleanup_{os.getpid()}.cmd"
     cleanup_script.write_text(
         "\r\n".join(
