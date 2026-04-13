@@ -30,6 +30,9 @@ import requests
 from PIL import ImageGrab
 
 with contextlib.suppress(ImportError):
+    import msvcrt
+
+with contextlib.suppress(ImportError):
     import tkinter as tk
 
 with contextlib.suppress(ImportError):
@@ -127,6 +130,8 @@ WATCHED_SERVICES = [
 
 BASE_DIR = Path(__file__).resolve().parent
 STATE_PATH = BASE_DIR / "agent_state.json"
+LOCK_PATH = BASE_DIR / "agent.lock"
+AGENT_LOCK_HANDLE: Any | None = None
 
 
 class GUID(ctypes.Structure):
@@ -262,6 +267,26 @@ def save_state(state: dict[str, Any]) -> None:
         json.dumps(state, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
+
+def ensure_single_instance() -> bool:
+    global AGENT_LOCK_HANDLE
+    if "msvcrt" not in globals():
+        return True
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(LOCK_PATH, "a+b")
+    try:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        handle.close()
+        return False
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()).encode("ascii", errors="ignore"))
+    handle.flush()
+    AGENT_LOCK_HANDLE = handle
+    return True
 
 
 def stable_device_id() -> str:
@@ -1873,6 +1898,9 @@ def main() -> None:
         return
 
     if changed_state:
+        return
+
+    if not ensure_single_instance():
         return
 
     run_loop()

@@ -6,7 +6,12 @@ import contextlib
 import html
 import json
 import os
+import platform
+import re
 import secrets
+import shutil
+import subprocess
+import urllib.request
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -16,6 +21,7 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
+from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 
@@ -37,6 +43,10 @@ CMD_OUTPUT_PREVIEW_CHARS = int(os.environ.get("PCBOT_CMD_OUTPUT_PREVIEW", "1000"
 PUBLIC_BASE_URL = os.environ.get("PCBOT_PUBLIC_BASE_URL", "").strip().rstrip("/")
 REMOTE_SESSION_TTL_SECONDS = int(os.environ.get("PCBOT_REMOTE_SESSION_TTL", "43200"))
 REMOTE_FRAME_TIMEOUT_SECONDS = int(os.environ.get("PCBOT_REMOTE_FRAME_TIMEOUT", "25"))
+AUTO_PUBLIC_TUNNEL = os.environ.get("PCBOT_AUTO_PUBLIC_TUNNEL", "1").strip().lower() not in {"0", "false", "off", "no"}
+CLOUDFLARED_DIR = DATA_DIR / "cloudflared"
+CLOUDFLARED_BIN = CLOUDFLARED_DIR / ("cloudflared.exe" if os.name == "nt" else "cloudflared")
+CLOUDFLARED_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.IGNORECASE)
 
 
 def utc_now() -> datetime:
@@ -498,8 +508,138 @@ class RemoteSessionManager:
                 self.sessions.pop(token, None)
 
 
+def cloudflared_download_url() -> str | None:
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if system == "linux":
+        if machine in {"x86_64", "amd64"}:
+            return "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+        if machine in {"aarch64", "arm64"}:
+            return "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
+    if system == "windows":
+        if machine in {"x86_64", "amd64"}:
+            return "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+        if machine in {"aarch64", "arm64"}:
+            return "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-arm64.exe"
+    return None
+
+
+class TunnelManager:
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.process: asyncio.subprocess.Process | None = None
+        self.public_url: str | None = None
+        self.last_error: str | None = None
+        self.owner_notified_url: str | None = None
+        self.watch_task: asyncio.Task[None] | None = None
+
+    async def ensure_binary(self) -> Path:
+        ensure_dirs()
+        CLOUDFLARED_DIR.mkdir(parents=True, exist_ok=True)
+        resolved = shutil.which("cloudflared")
+        if resolved:
+            return Path(resolved)
+        if CLOUDFLARED_BIN.exists():
+            if os.name != "nt":
+                CLOUDFLARED_BIN.chmod(0o755)
+            return CLOUDFLARED_BIN
+        url = cloudflared_download_url()
+        if not url:
+            raise RuntimeError(f"cloudflared unsupported on {platform.system()} {platform.machine()}")
+        with urllib.request.urlopen(url, timeout=60) as response:
+            CLOUDFLARED_BIN.write_bytes(response.read())
+        if os.name != "nt":
+            CLOUDFLARED_BIN.chmod(0o755)
+        return CLOUDFLARED_BIN
+
+    async def _read_output(self, stream: asyncio.StreamReader | None) -> None:
+        if stream is None:
+            return
+        while True:
+            line = await stream.readline()
+            if not line:
+                return
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+            match = CLOUDFLARED_URL_RE.search(text)
+            if match:
+                async with self.lock:
+                    self.public_url = match.group(0).rstrip("/")
+                    self.last_error = None
+
+    async def ensure_running(self) -> str | None:
+        async with self.lock:
+            if PUBLIC_BASE_URL:
+                self.public_url = PUBLIC_BASE_URL
+                return self.public_url
+            if not AUTO_PUBLIC_TUNNEL:
+                return None
+            if self.process and self.process.returncode is None and self.public_url:
+                return self.public_url
+            self.public_url = None
+            self.last_error = None
+            binary = await self.ensure_binary()
+            env = os.environ.copy()
+            env["HOME"] = str(CLOUDFLARED_DIR / "home")
+            Path(env["HOME"]).mkdir(parents=True, exist_ok=True)
+            self.process = await asyncio.create_subprocess_exec(
+                str(binary),
+                "tunnel",
+                "--url",
+                f"http://127.0.0.1:{API_PORT}",
+                "--no-autoupdate",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            asyncio.create_task(self._read_output(self.process.stdout))
+            asyncio.create_task(self._read_output(self.process.stderr))
+            if self.watch_task is None or self.watch_task.done():
+                self.watch_task = asyncio.create_task(self._watch())
+        deadline = asyncio.get_running_loop().time() + 25
+        while asyncio.get_running_loop().time() < deadline:
+            async with self.lock:
+                if self.public_url:
+                    return self.public_url
+                if self.process and self.process.returncode not in {None, 0}:
+                    break
+            await asyncio.sleep(0.25)
+        async with self.lock:
+            return self.public_url
+
+    async def _watch(self) -> None:
+        process: asyncio.subprocess.Process | None
+        async with self.lock:
+            process = self.process
+        if process is None:
+            return
+        await process.wait()
+        async with self.lock:
+            if self.process is process:
+                self.last_error = f"cloudflared exited with code {process.returncode}"
+                self.process = None
+                self.public_url = None
+
+    async def sweep(self) -> None:
+        url_to_notify: str | None = None
+        if PUBLIC_BASE_URL:
+            async with self.lock:
+                self.public_url = PUBLIC_BASE_URL
+            return
+        if AUTO_PUBLIC_TUNNEL:
+            url = await self.ensure_running()
+            async with self.lock:
+                if url and self.owner_notified_url != url:
+                    self.owner_notified_url = url
+                    url_to_notify = url
+        if url_to_notify:
+            await notify_owner(f"Mini App tunnel готов: {url_to_notify}")
+
+
 store = Store(STATE_PATH)
 remote_sessions = RemoteSessionManager()
+tunnel_manager = TunnelManager()
 api = FastAPI(title="Safe Telegram PC Bot")
 telegram_app: Application | None = None
 
@@ -662,8 +802,12 @@ def devices_keyboard(devices: list[dict[str, Any]], current_id: str | None = Non
     return InlineKeyboardMarkup(rows)
 
 
+def effective_public_base_url() -> str:
+    return (PUBLIC_BASE_URL or tunnel_manager.public_url or "").strip().rstrip("/")
+
+
 def public_remote_supported() -> bool:
-    return PUBLIC_BASE_URL.startswith("https://")
+    return effective_public_base_url().startswith("https://")
 
 
 def device_home_text(device: dict[str, Any]) -> str:
@@ -895,9 +1039,11 @@ async def selected_device(chat_id: int, explicit: str | None = None) -> dict[str
 
 async def build_remote_url(chat_id: int, device_id: str) -> str | None:
     if not public_remote_supported():
+        await tunnel_manager.ensure_running()
+    if not public_remote_supported():
         return None
     token = await remote_sessions.create(chat_id, device_id)
-    return f"{PUBLIC_BASE_URL}/remote/{token}"
+    return f"{effective_public_base_url()}/remote/{token}"
 
 
 async def root_menu_markup(chat_id: int, device_id: str) -> InlineKeyboardMarkup:
@@ -1004,6 +1150,18 @@ async def send_text(
 ) -> None:
     if update.effective_chat is None:
         return
+    query = update.callback_query
+    if query is not None and query.message is not None:
+        try:
+            await query.message.edit_text(
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+            )
+            return
+        except BadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=text,
@@ -1021,24 +1179,14 @@ async def send_result(
     if update.effective_chat is None:
         return
     if result is None:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"Команда {command_type}: время ожидания вышло. ПК может быть оффлайн.",
-        )
+        await send_text(update, context, f"Команда {command_type}: время ожидания вышло. ПК может быть оффлайн.")
         return
     payload = result.get("result", {})
     if command_type == "shell_cmd":
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=format_shell_result_html(payload),
-            parse_mode="HTML",
-        )
+        await send_text(update, context, format_shell_result_html(payload), parse_mode="HTML")
         return
     if not payload.get("ok", False):
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"Команда {command_type}: ошибка.\n{payload.get('message', 'Без деталей')}",
-        )
+        await send_text(update, context, f"Команда {command_type}: ошибка.\n{payload.get('message', 'Без деталей')}")
         return
     reply_markup = None
     if command_type == "apps":
@@ -1071,11 +1219,7 @@ async def send_result(
                 )
         return
     text = payload.get("message", "").strip() or json.dumps(payload.get("data", {}), indent=2, ensure_ascii=False)
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=text,
-        reply_markup=reply_markup,
-    )
+    await send_text(update, context, text, reply_markup=reply_markup)
 
 
 async def run_for_current(
@@ -1137,12 +1281,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await authorize(update) and update.effective_message:
-        await update.effective_message.reply_text(help_text())
+    if await authorize(update):
+        await send_text(update, context, help_text())
 
 
 async def pcs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await authorize(update) or update.effective_message is None or update.effective_chat is None:
+    if not await authorize(update) or update.effective_chat is None:
         return
     devices = await store.list_devices()
     online_count = sum(1 for device in devices if is_online(device))
@@ -1162,48 +1306,54 @@ async def pcs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
     else:
         body += "Пока нет подключённых агентов."
-    await update.effective_message.reply_html(
+    await send_text(
+        update,
+        context,
         body,
         reply_markup=devices_keyboard(devices, current["device_id"] if current else None),
+        parse_mode="HTML",
     )
 
 
 async def select_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await authorize(update) or update.effective_chat is None or update.effective_message is None:
+    if not await authorize(update) or update.effective_chat is None:
         return
     if not context.args:
         current = await selected_device(update.effective_chat.id)
         if not current:
-            await update.effective_message.reply_text("ПК не выбран. Сначала открой /pcs.")
+            await send_text(update, context, "ПК не выбран. Сначала открой /pcs.")
             return
         await show_device_root(update, context, current)
         return
     current = await selected_device(update.effective_chat.id, " ".join(context.args))
     if not current:
-        await update.effective_message.reply_text("ПК не найден.")
+        await send_text(update, context, "ПК не найден.")
         return
     await show_device_root(update, context, current)
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await authorize(update) or update.effective_chat is None or update.effective_message is None:
+    if not await authorize(update) or update.effective_chat is None:
         return
     current = await selected_device(update.effective_chat.id)
     if not current:
-        await update.effective_message.reply_text("ПК не выбран. Сначала открой /pcs.")
+        await send_text(update, context, "ПК не выбран. Сначала открой /pcs.")
         return
-    await update.effective_message.reply_html(
+    await send_text(
+        update,
+        context,
         device_card(current),
         reply_markup=await root_menu_markup(update.effective_chat.id, current["device_id"]),
+        parse_mode="HTML",
     )
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await authorize(update) or update.effective_chat is None or update.effective_message is None:
+    if not await authorize(update) or update.effective_chat is None:
         return
     current = await selected_device(update.effective_chat.id)
     if not current:
-        await update.effective_message.reply_text("Сначала выбери ПК через /pcs.")
+        await send_text(update, context, "Сначала выбери ПК через /pcs.")
         return
     await show_device_root(update, context, current)
 
@@ -1321,8 +1471,8 @@ async def update_agent_command(update: Update, context: ContextTypes.DEFAULT_TYP
 async def text_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text_value = extract_command_text(update)
     if not text_value:
-        if update.effective_message:
-            await update.effective_message.reply_text("Использование: /text <текст>")
+        if await authorize(update):
+            await send_text(update, context, "Использование: /text <текст>")
         return
     await run_for_current(update, context, "show_text", {"text": text_value}, use_cache=False)
 
@@ -1391,7 +1541,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         device_id = data.split(":", 1)[1]
         device = await store.get_device(device_id)
         if not device:
-            await query.message.reply_text("ПК не найден.")
+            await send_text(update, context, "ПК не найден.")
             return
         await store.set_selected(update.effective_chat.id, device_id)
         await send_text(
@@ -1406,12 +1556,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await pcs_command(update, context)
         return
     if data == "action:help":
-        await query.message.reply_text(help_text())
+        await send_text(update, context, help_text())
         return
     if data == "action:menu_root":
         current = await selected_device(update.effective_chat.id)
         if not current:
-            await query.message.reply_text("Сначала выбери устройство через /pcs.")
+            await send_text(update, context, "Сначала выбери устройство через /pcs.")
             return
         await send_text(
             update,
@@ -1422,43 +1572,63 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
     if data == "action:remote_unavailable":
-        await query.message.reply_text(
+        await send_text(
+            update,
+            context,
             "Mini App появится тут, когда сервер будет доступен по HTTPS и будет задан PCBOT_PUBLIC_BASE_URL."
         )
         return
     if data == "action:text_help":
-        await query.message.reply_text("Использование: /text <текст>")
+        await send_text(update, context, "Использование: /text <текст>")
         return
     if data == "action:section:monitor":
-        await query.message.reply_html(
+        await send_text(
+            update,
+            context,
             section_text("Мониторинг", "Система, сеть, скриншоты и процессы выбранного ПК."),
             reply_markup=monitor_keyboard(),
+            parse_mode="HTML",
         )
         return
     if data == "action:section:control":
-        await query.message.reply_html(
+        await send_text(
+            update,
+            context,
             section_text("Управление", "Блокировка, рестарт, выключение и показ текста на экране."),
             reply_markup=control_keyboard(),
+            parse_mode="HTML",
         )
         return
     if data == "action:section:apps":
-        await query.message.reply_html(
+        await send_text(
+            update,
+            context,
             section_text("Приложения", "Окна, процессы и джобы выбранного ПК."),
             reply_markup=apps_section_keyboard(),
+            parse_mode="HTML",
         )
         return
     if data == "action:section:maintenance":
-        await query.message.reply_html(
+        await send_text(
+            update,
+            context,
             section_text("Обслуживание", "Wi-Fi recovery, update агента и удаление установки."),
             reply_markup=maintenance_keyboard(),
+            parse_mode="HTML",
         )
         return
     if data == "action:delete_prompt":
         current = await selected_device(update.effective_chat.id)
         if not current:
-            await query.message.reply_text("Сначала выбери устройство через /pcs.")
+            await send_text(update, context, "Сначала выбери устройство через /pcs.")
             return
-        await query.message.reply_html(delete_prompt_text(current), reply_markup=delete_confirm_keyboard(current["device_id"]))
+        await send_text(
+            update,
+            context,
+            delete_prompt_text(current),
+            reply_markup=delete_confirm_keyboard(current["device_id"]),
+            parse_mode="HTML",
+        )
         return
     if data.startswith("delete:confirm:"):
         device_id = data.split(":", 2)[2]
@@ -1515,6 +1685,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def notifier_loop() -> None:
     while True:
         await remote_sessions.sweep()
+        await tunnel_manager.sweep()
         for device in await store.sweep_presence():
             await notify_owner(f"{device['display_name']} теперь оффлайн. Heartbeat не приходил дольше таймаута.")
         await asyncio.sleep(PRESENCE_SWEEP_INTERVAL_SECONDS)
@@ -1934,6 +2105,8 @@ async def main() -> None:
 
     async with telegram_app:
         await telegram_app.initialize()
+        if not PUBLIC_BASE_URL and AUTO_PUBLIC_TUNNEL:
+            asyncio.create_task(tunnel_manager.ensure_running())
         if telegram_app.updater is None:
             raise RuntimeError("Telegram updater is unavailable.")
         await telegram_app.start()
