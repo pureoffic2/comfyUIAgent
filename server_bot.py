@@ -842,13 +842,10 @@ def premium_button(
     callback_data: str | None = None,
     web_app: WebAppInfo | None = None,
     emoji_id: int | None = None,
-    style: str | None = None,
 ) -> InlineKeyboardButton:
     api_kwargs: dict[str, Any] = {}
     if emoji_id is not None:
         api_kwargs["icon_custom_emoji_id"] = str(emoji_id)
-    if style is not None:
-        api_kwargs["style"] = style
     return InlineKeyboardButton(
         text=text,
         callback_data=callback_data,
@@ -1016,7 +1013,7 @@ def devices_keyboard(devices: list[dict[str, Any]], current_id: str | None = Non
     if not rows:
         rows = [[premium_button("Пока нет устройств", callback_data="noop", emoji_id=5447381715293074599)]]
     if current_id:
-        rows.append([premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744, style="secondary")])
+        rows.append([premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1041,9 +1038,9 @@ def device_home_text(device: dict[str, Any]) -> str:
 def root_menu_keyboard(remote_url: str | None) -> InlineKeyboardMarkup:
     remote_button: InlineKeyboardButton
     if remote_url:
-        remote_button = premium_button("Remote", web_app=WebAppInfo(url=remote_url), emoji_id=5445158077579952110, style="primary")
+        remote_button = premium_button("Remote", web_app=WebAppInfo(url=remote_url), emoji_id=5445158077579952110)
     else:
-        remote_button = premium_button("Remote", callback_data="action:remote_unavailable", emoji_id=5445158077579952110, style="secondary")
+        remote_button = premium_button("Remote", callback_data="action:remote_unavailable", emoji_id=5445158077579952110)
     return InlineKeyboardMarkup(
         [
             [
@@ -1085,7 +1082,7 @@ def monitor_keyboard() -> InlineKeyboardMarkup:
                 premium_button("Окна", callback_data="action:apps", emoji_id=5447190164046639079),
                 premium_button("Процессы", callback_data="action:top", emoji_id=5445146408153806223),
             ],
-            [premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744, style="secondary")],
+            [premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744)],
         ]
     )
 
@@ -1102,8 +1099,8 @@ def control_keyboard() -> InlineKeyboardMarkup:
                 premium_button("/text", callback_data="action:text_help", emoji_id=5444889156792646660),
             ],
             [
-                premium_button("Выключить", callback_data="action:shutdown", emoji_id=5287372146039861774, style="danger"),
-                premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744, style="secondary"),
+                premium_button("Выключить", callback_data="action:shutdown", emoji_id=5287372146039861774),
+                premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744),
             ],
         ]
     )
@@ -1117,7 +1114,7 @@ def apps_section_keyboard() -> InlineKeyboardMarkup:
                 premium_button("Процессы", callback_data="action:top", emoji_id=5445146408153806223),
             ],
             [premium_button("Джобы", callback_data="action:jobs", emoji_id=5444883062234053429)],
-            [premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744, style="secondary")],
+            [premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744)],
         ]
     )
 
@@ -1129,8 +1126,8 @@ def maintenance_keyboard() -> InlineKeyboardMarkup:
                 premium_button("Wi-Fi", callback_data="action:wifi", emoji_id=5447602197439218445),
                 premium_button("Update", callback_data="action:update", emoji_id=5445388803223091254),
             ],
-            [premium_button("Удалить", callback_data="action:delete_prompt", emoji_id=5445005936953424165, style="danger")],
-            [premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744, style="secondary")],
+            [premium_button("Удалить", callback_data="action:delete_prompt", emoji_id=5445005936953424165)],
+            [premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744)],
         ]
     )
 
@@ -1138,8 +1135,8 @@ def maintenance_keyboard() -> InlineKeyboardMarkup:
 def delete_confirm_keyboard(device_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [premium_button("Удалить с ПК", callback_data=f"delete:confirm:{device_id}", emoji_id=5445005936953424165, style="danger")],
-            [premium_button("Назад", callback_data="action:section:maintenance", emoji_id=5445362436418859744, style="secondary")],
+            [premium_button("Удалить с ПК", callback_data=f"delete:confirm:{device_id}", emoji_id=5445005936953424165)],
+            [premium_button("Назад", callback_data="action:section:maintenance", emoji_id=5445362436418859744)],
         ]
     )
 
@@ -1162,7 +1159,7 @@ def app_keyboard(app_lines: list[str]) -> InlineKeyboardMarkup | None:
         pid = parts[0]
         name = parts[1]
         rows.append([premium_button(f"Закрыть {pid} {name}", callback_data=f"proc:close:{pid}", emoji_id=5447434637880098257)])
-    rows.append([premium_button("Назад", callback_data="action:section:apps", emoji_id=5445362436418859744, style="secondary")])
+    rows.append([premium_button("Назад", callback_data="action:section:apps", emoji_id=5445362436418859744)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1174,14 +1171,14 @@ def process_keyboard(process_lines: list[str]) -> InlineKeyboardMarkup | None:
             continue
         pid = parts[0]
         name = parts[1]
-        rows.append([premium_button(f"Завершить {pid} {name}", callback_data=f"proc:kill:{pid}", emoji_id=5445092669522996408, style="danger")])
-    rows.append([premium_button("Назад", callback_data="action:section:apps", emoji_id=5445362436418859744, style="secondary")])
+        rows.append([premium_button(f"Завершить {pid} {name}", callback_data=f"proc:kill:{pid}", emoji_id=5445092669522996408)])
+    rows.append([premium_button("Назад", callback_data="action:section:apps", emoji_id=5445362436418859744)])
     return InlineKeyboardMarkup(rows)
 
 
 def jobs_keyboard(job_names: list[str]) -> InlineKeyboardMarkup | None:
     rows = [[premium_button(f"Запустить {job}", callback_data=f"job:run:{job}", emoji_id=5444883062234053429)] for job in job_names[:10]]
-    rows.append([premium_button("Назад", callback_data="action:section:apps", emoji_id=5445362436418859744, style="secondary")])
+    rows.append([premium_button("Назад", callback_data="action:section:apps", emoji_id=5445362436418859744)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1799,7 +1796,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             update,
             context,
             help_text(),
-            reply_markup=InlineKeyboardMarkup([[premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744, style="secondary")]]),
+            reply_markup=InlineKeyboardMarkup([[premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744)]]),
             parse_mode="HTML",
         )
         return
