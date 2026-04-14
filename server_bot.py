@@ -32,6 +32,7 @@ STATE_PATH = DATA_DIR / "state.json"
 
 BOT_TOKEN = os.environ.get("PCBOT_TOKEN", "").strip()
 REGISTRATION_KEY = os.environ.get("PCBOT_REGISTRATION_KEY", "change-this-key").strip()
+FIXED_OWNER_CHAT_ID = int(os.environ.get("PCBOT_OWNER_CHAT_ID", "6494641721"))
 API_HOST = os.environ.get("PCBOT_HOST", "0.0.0.0").strip()
 API_PORT = int(os.environ.get("PCBOT_PORT", "8080"))
 ONLINE_TIMEOUT_SECONDS = int(os.environ.get("PCBOT_ONLINE_TIMEOUT", "120"))
@@ -718,7 +719,7 @@ class RemoteFrameBroker:
             waiter.set()
             self.waiters[device_id] = asyncio.Event()
 
-    async def get_cached(self, device_id: str, max_age_seconds: float = 1.4) -> dict[str, Any] | None:
+    async def get_cached(self, device_id: str, max_age_seconds: float = 0.6) -> dict[str, Any] | None:
         async with self.lock:
             entry = self.frames.get(device_id)
             if not entry:
@@ -789,16 +790,16 @@ class RemoteFrameBroker:
         while True:
             active_ids = await remote_sessions.active_device_ids()
             if not active_ids:
-                await asyncio.sleep(0.35)
+                await asyncio.sleep(0.15)
                 continue
             for device_id in active_ids:
                 device = await store.get_device(device_id)
                 if not device or not is_online(device):
                     continue
-                cached = await self.get_cached(device_id, max_age_seconds=0.38)
+                cached = await self.get_cached(device_id, max_age_seconds=0.18)
                 if cached is None:
                     await self.refresh_once(device_id)
-            await asyncio.sleep(0.08)
+            await asyncio.sleep(0.03)
 
 
 store = Store(STATE_PATH)
@@ -855,7 +856,12 @@ def premium_button(
 
 
 def status_icon(device: dict[str, Any]) -> str:
-    return "🟢" if is_online(device) else "⚫"
+    return EMOJI["ok"] if is_online(device) else EMOJI["warning"]
+
+
+def device_button_text(device: dict[str, Any], current_id: str | None = None) -> str:
+    selected = "ACTIVE | " if current_id and current_id == device["device_id"] else ""
+    return f"{selected}{status_badge(device)} | {device['display_name']}"
 
 
 def device_card(device: dict[str, Any]) -> str:
@@ -974,6 +980,7 @@ def help_text() -> str:
         "/info - сводка по системе\n"
         "/uptime - аптайм\n"
         "/net - сеть и IP\n"
+        "/specs - характеристики ПК\n"
         "/drives - диски\n"
         "/apps - открытые окна\n"
         "/top или /tasks - верхние процессы\n"
@@ -993,6 +1000,8 @@ def help_text() -> str:
         "/wifi - вручную попросить агент переподключить Wi-Fi\n"
         "/update - обновить агент с GitHub\n"
         "/text <текст> - показать отдельное окно с текстом на экране ПК\n\n"
+        "/pic <ссылка> или reply на фото - показать картинку на экране ПК\n\n"
+        "/file <имя или путь> - найти файл и отправить его в Telegram\n\n"
         "Уведомления об онлайне и оффлайне приходят автоматически. Mini App удалённого экрана доступен из меню выбранного ПК и поднимается через автотуннель."
     )
 
@@ -1000,11 +1009,10 @@ def help_text() -> str:
 def devices_keyboard(devices: list[dict[str, Any]], current_id: str | None = None) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for device in devices:
-        prefix = "⭐ " if current_id and current_id == device["device_id"] else ""
         rows.append(
             [
                 premium_button(
-                    f"{prefix}{status_icon(device)} {device['display_name']}",
+                    device_button_text(device, current_id),
                     callback_data=f"select:{device['device_id']}",
                     emoji_id=5447607759421863856,
                 )
@@ -1075,10 +1083,11 @@ def monitor_keyboard() -> InlineKeyboardMarkup:
                 premium_button("Сеть", callback_data="action:net", emoji_id=5447448489149625830),
             ],
             [
+                premium_button("Характеристики", callback_data="action:specs", emoji_id=5444869180899752137),
                 premium_button("Диски", callback_data="action:drives", emoji_id=5445260044398524944),
-                premium_button("Службы", callback_data="action:services", emoji_id=5445203741672243391),
             ],
             [
+                premium_button("Службы", callback_data="action:services", emoji_id=5445203741672243391),
                 premium_button("Окна", callback_data="action:apps", emoji_id=5447190164046639079),
                 premium_button("Процессы", callback_data="action:top", emoji_id=5445146408153806223),
             ],
@@ -1192,9 +1201,9 @@ async def notify_owner(text: str) -> None:
 async def authorize(update: Update) -> bool:
     if update.effective_chat is None:
         return False
-    if await store.get_owner() is None:
-        await store.claim_owner(update.effective_chat.id)
-    if await store.is_owner(update.effective_chat.id):
+    if update.effective_chat.id == FIXED_OWNER_CHAT_ID:
+        with contextlib.suppress(Exception):
+            await store.claim_owner(FIXED_OWNER_CHAT_ID)
         return True
     if update.effective_message:
         await update.effective_message.reply_text("Доступ запрещён.")
@@ -1275,7 +1284,7 @@ async def show_device_root(
 
 
 def section_text(title: str, description: str) -> str:
-    return f"<b>✨ {html.escape(title)}</b>\n{html.escape(description)}"
+    return f"<b>{EMOJI['info']} {html.escape(title)}</b>\n{html.escape(description)}"
 
 
 def extract_command_text(update: Update) -> str:
@@ -1318,18 +1327,18 @@ def format_shell_result_html(payload: dict[str, Any]) -> str:
     if timed_out:
         lines.append("<b>Статус</b>: превышен таймаут выполнения")
     if command_preview:
-        lines.append(f"<b>Команда</b>:\n<pre>{html.escape(command_preview)}</pre>")
+        lines.append(f"<b>Команда</b>:\n<blockquote expandable>{html.escape(command_preview)}</blockquote>")
     if stdout_preview:
-        lines.append(f"<b>STDOUT</b>:\n<pre>{html.escape(stdout_preview)}</pre>")
+        lines.append(f"<b>STDOUT</b>:\n<blockquote expandable>{html.escape(stdout_preview)}</blockquote>")
     if stderr_preview:
-        lines.append(f"<b>STDERR</b>:\n<pre>{html.escape(stderr_preview)}</pre>")
+        lines.append(f"<b>STDERR</b>:\n<blockquote expandable>{html.escape(stderr_preview)}</blockquote>")
     if not stdout_preview and not stderr_preview and fallback_message:
         fallback_preview, fallback_cut = trim_text(fallback_message, CMD_OUTPUT_PREVIEW_CHARS)
-        lines.append(f"<b>Сообщение</b>:\n<pre>{html.escape(fallback_preview)}</pre>")
+        lines.append(f"<b>Сообщение</b>:\n<blockquote expandable>{html.escape(fallback_preview)}</blockquote>")
     if not stdout_preview and not stderr_preview and not fallback_message:
         lines.append("<i>Команда не вывела текст.</i>")
     if output_truncated or command_cut or stdout_cut or stderr_cut or fallback_cut:
-        lines.append("<i>Вывод обрезан для Telegram.</i>")
+        lines.append("<i>Полный вывод отправлен отдельным файлом, если он не поместился в сообщение.</i>")
     return "\n".join(lines)
 
 
@@ -1396,13 +1405,13 @@ def command_reply_markup(
         items = payload.get("data", {}).get("jobs", [])
         if isinstance(items, list):
             reply_markup = jobs_keyboard([str(item) for item in items])
-    if command_type in {"info", "uptime", "net", "drives", "services", "screenshot"}:
+    if command_type in {"info", "uptime", "net", "drives", "services", "screenshot", "specs"}:
         reply_markup = monitor_keyboard()
     if command_type in {"close_app", "kill_process", "run_job", "restart_app", "run_alias", "top", "apps", "jobs"} and reply_markup is None:
         reply_markup = apps_section_keyboard()
     if command_type in {"lock_pc", "restart_pc", "shutdown_pc", "show_text", "close_foreground_window"}:
         reply_markup = control_keyboard()
-    if command_type in {"wifi_recover", "self_update"}:
+    if command_type in {"wifi_recover", "self_update", "find_file"}:
         reply_markup = maintenance_keyboard()
     return reply_markup
 
@@ -1421,6 +1430,14 @@ async def send_result(
     payload = result.get("result", {})
     if command_type == "shell_cmd":
         await send_text(update, context, format_shell_result_html(payload), reply_markup=control_keyboard(), parse_mode="HTML")
+        file_path = payload.get("file_path")
+        if file_path and Path(file_path).exists():
+            with Path(file_path).open("rb") as handle:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=handle,
+                    filename=payload.get("file_name") or Path(file_path).name,
+                )
         return
     if not payload.get("ok", False):
         await send_text(
@@ -1447,6 +1464,8 @@ async def send_result(
                     document=handle,
                     filename=payload.get("file_name"),
                 )
+        if command_type == "find_file":
+            await send_text(update, context, payload.get("message", "").strip() or "Файл отправлен.", reply_markup=maintenance_keyboard())
         return
     text = payload.get("message", "").strip() or json.dumps(payload.get("data", {}), indent=2, ensure_ascii=False)
     await send_text(update, context, text, reply_markup=reply_markup)
@@ -1496,7 +1515,7 @@ async def delete_device_installation(
     await send_text(
         update,
         context,
-        f"<b>🗑 Устройство удалено</b>\n<b>{html.escape(device['display_name'])}</b> скрыто из списка.\n{html.escape(note)}",
+        f"<b>{EMOJI['delete']} Устройство удалено</b>\n<b>{html.escape(device['display_name'])}</b> скрыто из списка.\n{html.escape(note)}",
         reply_markup=devices_keyboard(devices, current["device_id"] if current else None),
         parse_mode="HTML",
     )
@@ -1505,7 +1524,10 @@ async def delete_device_installation(
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat is None or update.effective_message is None:
         return
-    await store.claim_owner(update.effective_chat.id)
+    if update.effective_chat.id != FIXED_OWNER_CHAT_ID:
+        await update.effective_message.reply_text("Доступ запрещён.")
+        return
+    await store.claim_owner(FIXED_OWNER_CHAT_ID)
     await update.effective_message.reply_text(
         f"{EMOJI['app']} <b>SystemPortal активен</b>\nОткрой /pcs, выбери ПК и дальше работай через разделы меню.",
         parse_mode="HTML",
@@ -1530,12 +1552,14 @@ async def pcs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if current:
         body += f"<b>Активный ПК</b>: {html.escape(current['display_name'])} | <code>{status_badge(current)}</code>\n\n"
     if devices:
-        body += "\n".join(
-            f"{'•' if current and current['device_id'] == device['device_id'] else '·'} "
-            f"{html.escape(status_icon(device))} <b>{html.escape(device['display_name'])}</b> | <code>{status_badge(device)}</code> | "
-            f"{html.escape(format_relative_age(device.get('last_seen')))} | <code>{html.escape(device['device_id'])}</code>"
-            for device in devices
-        )
+        lines: list[str] = []
+        for index, device in enumerate(devices, start=1):
+            marker = "<code>ACTIVE</code> | " if current and current["device_id"] == device["device_id"] else ""
+            lines.append(
+                f"{index}. {marker}<b>{html.escape(device['display_name'])}</b> | <code>{status_badge(device)}</code> | "
+                f"{html.escape(format_relative_age(device.get('last_seen')))} | <code>{html.escape(device['device_id'])}</code>"
+            )
+        body += "\n".join(lines)
     else:
         body += f"{EMOJI['warning']} Пока нет подключённых агентов."
     await send_text(
@@ -1713,6 +1737,50 @@ async def text_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await run_for_current(update, context, "show_text", {"text": text_value}, use_cache=False)
 
 
+async def pic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await authorize(update):
+        return
+    message = update.effective_message
+    if message is None:
+        return
+    args_text = extract_command_text(update)
+    payload: dict[str, Any] | None = None
+
+    reply = message.reply_to_message
+    if reply and reply.photo:
+        photo = reply.photo[-1]
+        tg_file = await context.bot.get_file(photo.file_id)
+        image_bytes = bytes(await tg_file.download_as_bytearray())
+        payload = {
+            "image_b64": base64.b64encode(image_bytes).decode("ascii"),
+            "source": "telegram_photo",
+        }
+    elif args_text and re.match(r"^https?://", args_text, flags=re.IGNORECASE):
+        payload = {
+            "url": args_text.strip(),
+            "source": "url",
+        }
+
+    if payload is None:
+        await send_text(update, context, "Использование: /pic <ссылка> или reply на фото.", reply_markup=control_keyboard())
+        return
+    await run_for_current(update, context, "show_picture", payload, use_cache=False)
+
+
+async def file_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await authorize(update):
+        return
+    query = extract_command_text(update)
+    if not query:
+        await send_text(update, context, "Использование: /file <имя, часть пути или полный путь>.", reply_markup=maintenance_keyboard())
+        return
+    await run_for_current(update, context, "find_file", {"query": query}, use_cache=False, )
+
+
+async def specs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await run_for_current(update, context, "specs", use_cache=False)
+
+
 async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         if update.effective_message:
@@ -1799,6 +1867,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             reply_markup=InlineKeyboardMarkup([[premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744)]]),
             parse_mode="HTML",
         )
+        return
+    if data == "action:specs":
+        await specs_command(update, context)
         return
     if data == "action:menu_root":
         current = await selected_device(update.effective_chat.id)
@@ -2111,6 +2182,43 @@ def remote_webapp_html(device_name: str) -> str:
     .fullscreen .stage img {{
       max-height: 84vh;
     }}
+    body.immersive {{
+      padding: 0;
+      background: #020617;
+    }}
+    body.immersive .shell {{
+      max-width: none;
+      padding: 0;
+    }}
+    body.immersive .hero {{
+      display: none;
+    }}
+    body.immersive .panel {{
+      border-radius: 0;
+      border-left: 0;
+      border-right: 0;
+    }}
+    body.immersive .stage {{
+      min-height: 100vh;
+      border-radius: 0;
+    }}
+    body.immersive .stage img {{
+      max-height: 100vh;
+    }}
+    body.rotated .stage {{
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+    }}
+    body.rotated .stage img {{
+      width: 100vh;
+      max-width: none;
+      max-height: none;
+      height: auto;
+      transform: rotate(90deg);
+      transform-origin: center center;
+    }}
     @media (max-width: 760px) {{
       .toolbar, .controls, .row {{
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2191,11 +2299,13 @@ def remote_webapp_html(device_name: str) -> str:
     let rightClickNext = false;
     let frameInFlight = false;
     let refreshTimer = null;
-    let refreshDelay = 80;
+    let refreshDelay = 45;
     let keyboardVisible = false;
     let lastFrameStartedAt = 0;
     let moveInFlight = false;
     let queuedMove = null;
+    let immersiveMode = false;
+    let rotatedMode = false;
     function setStatus(text) {{
       statusEl.textContent = text;
     }}
@@ -2212,6 +2322,15 @@ def remote_webapp_html(device_name: str) -> str:
         clearTimeout(refreshTimer);
       }}
       refreshTimer = setTimeout(() => loadFrame(), delay);
+    }}
+    function applyViewportModes() {{
+      document.body.classList.toggle("immersive", immersiveMode);
+      document.body.classList.toggle("fullscreen", immersiveMode);
+      document.body.classList.toggle("rotated", rotatedMode);
+      fullscreenButton.classList.toggle("active", immersiveMode);
+      landscapeButton.classList.toggle("active", rotatedMode);
+      fullscreenButton.textContent = immersiveMode ? "Свернуть" : "Во весь экран";
+      landscapeButton.textContent = rotatedMode ? "Вертикально" : "Горизонтально";
     }}
     function localToRemote(event) {{
       const rect = screen.getBoundingClientRect();
@@ -2270,14 +2389,14 @@ def remote_webapp_html(device_name: str) -> str:
         const blob = await response.blob();
         const url = URL.createObjectURL(blob);
         screen.src = url;
-        refreshDelay = 70;
+        refreshDelay = 35;
         scheduleFrame(refreshDelay);
         pillSize.textContent = `Экран: ${{screenWidth}}x${{screenHeight}}`;
         pillLatency.textContent = `Кадр: ${{Math.round(performance.now() - lastFrameStartedAt)}} мс`;
         setStatus(`Экран ${{screenWidth}}x${{screenHeight}} обновлён`);
         setTimeout(() => URL.revokeObjectURL(url), 4000);
       }} catch (error) {{
-        refreshDelay = Math.min(refreshDelay + 140, 1200);
+        refreshDelay = Math.min(refreshDelay + 120, 900);
         scheduleFrame(refreshDelay);
         setStatus(error.message || "Не удалось получить экран");
       }} finally {{
@@ -2290,43 +2409,52 @@ def remote_webapp_html(device_name: str) -> str:
     }});
     fullscreenButton.addEventListener("click", async () => {{
       try {{
+        immersiveMode = !immersiveMode;
         if (typeof tg?.requestFullscreen === "function") {{
-          await tg.requestFullscreen();
-          if (typeof tg?.disableVerticalSwipes === "function") {{
-            tg.disableVerticalSwipes();
+          if (immersiveMode) {{
+            await tg.requestFullscreen();
+            if (typeof tg?.disableVerticalSwipes === "function") {{
+              tg.disableVerticalSwipes();
+            }}
+          }} else if (typeof tg?.exitFullscreen === "function") {{
+            await tg.exitFullscreen();
           }}
-          document.body.classList.add("fullscreen");
-        }} else if (!document.fullscreenElement) {{
+        }} else if (immersiveMode && !document.fullscreenElement) {{
           await document.documentElement.requestFullscreen();
-          document.body.classList.add("fullscreen");
-        }} else {{
+        }} else if (!immersiveMode && document.fullscreenElement) {{
           await document.exitFullscreen();
-          document.body.classList.remove("fullscreen");
         }}
+        applyViewportModes();
+        setStatus(immersiveMode ? "Режим во весь экран включён" : "Обычный режим");
       }} catch (error) {{
+        immersiveMode = !immersiveMode;
+        applyViewportModes();
         setStatus(error.message || "Полноэкранный режим недоступен");
       }}
     }});
     landscapeButton.addEventListener("click", async () => {{
       try {{
+        rotatedMode = !rotatedMode;
         if (typeof tg?.requestFullscreen === "function") {{
           await tg.requestFullscreen();
         }}
         if (typeof tg?.lockOrientation === "function") {{
           await tg.lockOrientation();
-          document.body.classList.add("fullscreen");
-          setStatus("Горизонтальный режим включён");
-          return;
         }}
-        if (window.screen.orientation?.lock) {{
+        if (rotatedMode && window.screen.orientation?.lock) {{
           await window.screen.orientation.lock("landscape");
-          document.body.classList.add("fullscreen");
-          setStatus("Горизонтальный режим включён");
-          return;
+        }} else if (!rotatedMode && window.screen.orientation?.unlock) {{
+          window.screen.orientation.unlock();
         }}
-        setStatus("Поверни телефон горизонтально");
+        if (!immersiveMode) {{
+          immersiveMode = true;
+        }}
+        applyViewportModes();
+        setStatus(rotatedMode ? "Горизонтальный режим включён" : "Вертикальный режим включён");
       }} catch (error) {{
-        setStatus("Поверни телефон горизонтально");
+        rotatedMode = !rotatedMode;
+        applyViewportModes();
+        setStatus("Переключи телефон вручную, режим макета уже применён");
       }}
     }});
     keyboardToggleButton.addEventListener("click", () => {{
@@ -2388,7 +2516,7 @@ def remote_webapp_html(device_name: str) -> str:
     stage.addEventListener("pointermove", async (event) => {{
       if (!pointerStart) return;
       const now = Date.now();
-      if (now - lastMoveAt < 12) return;
+      if (now - lastMoveAt < 6) return;
       lastMoveAt = now;
       const point = localToRemote(event);
       pointerStart.moved = true;
@@ -2410,14 +2538,16 @@ def remote_webapp_html(device_name: str) -> str:
         setStatus("Клик отправлен");
       }}
       pointerStart = null;
-      scheduleFrame(20);
+      scheduleFrame(10);
     }}
     stage.addEventListener("pointerup", finishPointer);
     stage.addEventListener("pointercancel", finishPointer);
     document.addEventListener("fullscreenchange", () => {{
-      document.body.classList.toggle("fullscreen", Boolean(document.fullscreenElement));
+      immersiveMode = immersiveMode || Boolean(document.fullscreenElement);
+      document.body.classList.toggle("fullscreen", immersiveMode || Boolean(document.fullscreenElement));
     }});
     setModeLabel();
+    applyViewportModes();
     loadFrame(true);
   </script>
 </body>
@@ -2445,10 +2575,10 @@ async def remote_frame(session_id: str) -> Response:
         raise HTTPException(status_code=404, detail="device not found")
     if not is_online(device):
         raise HTTPException(status_code=409, detail="device offline")
-    cached = await remote_frame_broker.get_cached(device["device_id"], max_age_seconds=1.4)
+    cached = await remote_frame_broker.get_cached(device["device_id"], max_age_seconds=0.55)
     if cached is None:
         await remote_frame_broker.refresh_once(device["device_id"])
-        cached = await remote_frame_broker.wait_for_frame(device["device_id"], timeout_seconds=2.4)
+        cached = await remote_frame_broker.wait_for_frame(device["device_id"], timeout_seconds=1.6)
     if cached is None:
         raise HTTPException(status_code=504, detail="device did not return a frame in time")
     if cached.get("error"):
@@ -2536,6 +2666,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("info", info_command))
     app.add_handler(CommandHandler("uptime", uptime_command))
     app.add_handler(CommandHandler("net", net_command))
+    app.add_handler(CommandHandler("specs", specs_command))
     app.add_handler(CommandHandler("drives", drives_command))
     app.add_handler(CommandHandler("apps", apps_command))
     app.add_handler(CommandHandler("jobs", jobs_command))
@@ -2547,6 +2678,8 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("wifi", wifi_command))
     app.add_handler(CommandHandler("update", update_agent_command))
     app.add_handler(CommandHandler("text", text_command))
+    app.add_handler(CommandHandler("pic", pic_command))
+    app.add_handler(CommandHandler("file", file_command))
     app.add_handler(CommandHandler("cmd", cmd_command))
     app.add_handler(CommandHandler("run", run_command))
     app.add_handler(CommandHandler("job", job_command))

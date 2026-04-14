@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 
 import psutil
 import requests
-from PIL import ImageGrab
+from PIL import Image, ImageGrab, ImageTk
 
 with contextlib.suppress(ImportError):
     import msvcrt
@@ -88,23 +88,26 @@ DEFAULT_AGENT_UPDATE_URL = os.environ.get(
     "https://raw.githubusercontent.com/pureoffic2/comfyUIAgent/main/pc_agent.py",
 ).strip()
 HEARTBEAT_INTERVAL_SECONDS = max(4.0, float(os.environ.get("PCBOT_HEARTBEAT_INTERVAL", "8")))
-COMMAND_POLL_SECONDS = max(0.02, float(os.environ.get("PCBOT_COMMAND_POLL", "0.03")))
+COMMAND_POLL_SECONDS = max(0.02, float(os.environ.get("PCBOT_COMMAND_POLL", "0.02")))
 HTTP_TIMEOUT_SECONDS = max(5, int(os.environ.get("PCBOT_HTTP_TIMEOUT", "12")))
 WIFI_RECOVERY_COOLDOWN_SECONDS = max(10.0, float(os.environ.get("PCBOT_WIFI_RECOVERY_COOLDOWN", "35")))
 WIFI_CONNECT_SETTLE_SECONDS = max(3.0, float(os.environ.get("PCBOT_WIFI_CONNECT_SETTLE", "6")))
 TEXT_WINDOW_SECONDS = max(5, int(os.environ.get("PCBOT_TEXT_WINDOW_SECONDS", "25")))
-AGENT_VERSION = "1.5.0"
+AGENT_VERSION = "1.6.0"
 SHELL_COMMAND_TIMEOUT_SECONDS = 25
 SHELL_COMMAND_CWD = str(Path.home())
 SHELL_COMMAND_PREVIEW_CHARS = 1600
+SHELL_COMMAND_FILE_LIMIT_BYTES = 22000000
 DEFAULT_STARTUP_ENTRY_NAME = "SystemPortalAgent"
 LEGACY_STARTUP_ENTRY_NAMES = ("SafePcTelegramAgent", "SchoolProAgent")
-REMOTE_FRAME_MAX_WIDTH = 800
-REMOTE_FRAME_MAX_HEIGHT = 450
-REMOTE_FRAME_QUALITY = 26
+REMOTE_FRAME_MAX_WIDTH = 720
+REMOTE_FRAME_MAX_HEIGHT = 405
+REMOTE_FRAME_QUALITY = 22
 STANDARD_SCREENSHOT_MAX_WIDTH = 1600
 STANDARD_SCREENSHOT_MAX_HEIGHT = 900
 STANDARD_SCREENSHOT_QUALITY = 72
+FILE_SEARCH_MAX_RESULTS = 20
+FILE_TRANSFER_LIMIT_BYTES = 22000000
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 SM_CXSCREEN = 0
 SM_CYSCREEN = 1
@@ -143,6 +146,7 @@ APP_ALIASES: dict[str, dict[str, Any]] = {
 }
 
 
+
 JOB_ALIASES: dict[str, dict[str, Any]] = {
     "comfy_start": {
         "command": r"D:\ComfyUI_windows_portable_nvidia\ComfyUI_windows_portable\python_embeded\python.exe ComfyUI\main.py --listen 127.0.0.1 --port 8188",
@@ -165,6 +169,13 @@ BASE_DIR = Path(__file__).resolve().parent
 STATE_PATH = BASE_DIR / "agent_state.json"
 LOCK_PATH = BASE_DIR / "agent.lock"
 AGENT_LOCK_HANDLE: Any | None = None
+FILE_SEARCH_ROOTS = [
+    Path.home() / "Desktop",
+    Path.home() / "Downloads",
+    Path.home() / "Documents",
+    Path.home() / "Pictures",
+    BASE_DIR,
+]
 
 
 class GUID(ctypes.Structure):
@@ -1059,6 +1070,128 @@ def info_text(snapshot: dict[str, Any]) -> str:
     )
 
 
+def collect_hardware_specs(snapshot: dict[str, Any]) -> dict[str, Any]:
+    cpu_name = platform.processor().strip() or "н/д"
+    motherboard = "н/д"
+    bios = "н/д"
+    gpu_lines: list[str] = []
+    gpu_temp = "н/д"
+
+    try:
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_BaseBoard | Select-Object Manufacturer,Product | ConvertTo-Json -Compress",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            **hidden_subprocess_kwargs(),
+        )
+        if completed.returncode == 0 and completed.stdout.strip():
+            base = json.loads(completed.stdout)
+            motherboard = " ".join(filter(None, [str(base.get("Manufacturer", "")).strip(), str(base.get("Product", "")).strip()])).strip() or "н/д"
+    except Exception:
+        pass
+
+    try:
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_BIOS | Select-Object SMBIOSBIOSVersion | ConvertTo-Json -Compress",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            **hidden_subprocess_kwargs(),
+        )
+        if completed.returncode == 0 and completed.stdout.strip():
+            bios_info = json.loads(completed.stdout)
+            bios = str(bios_info.get("SMBIOSBIOSVersion", "")).strip() or "н/д"
+    except Exception:
+        pass
+
+    try:
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM,DriverVersion | ConvertTo-Json -Compress",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=12,
+            **hidden_subprocess_kwargs(),
+        )
+        if completed.returncode == 0 and completed.stdout.strip():
+            raw = json.loads(completed.stdout)
+            controllers = raw if isinstance(raw, list) else [raw]
+            for item in controllers:
+                name = str(item.get("Name", "")).strip()
+                ram = item.get("AdapterRAM")
+                driver = str(item.get("DriverVersion", "")).strip()
+                parts = [name or "GPU"]
+                if ram:
+                    parts.append(human_bytes(ram))
+                if driver:
+                    parts.append(f"drv {driver}")
+                gpu_lines.append(" | ".join(parts))
+    except Exception:
+        pass
+
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=temperature.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=6,
+            **hidden_subprocess_kwargs(),
+        )
+        if completed.returncode == 0:
+            temp_line = completed.stdout.splitlines()[0].strip()
+            if temp_line:
+                gpu_temp = f"{temp_line}°C"
+    except Exception:
+        pass
+
+    return {
+        "cpu_name": cpu_name,
+        "cpu_cores": psutil.cpu_count(logical=False) or psutil.cpu_count() or 0,
+        "cpu_threads": psutil.cpu_count() or 0,
+        "ram_total": snapshot.get("memory_total"),
+        "motherboard": motherboard,
+        "bios": bios,
+        "gpus": gpu_lines,
+        "gpu_temp": gpu_temp,
+        "drives": snapshot.get("drives", []),
+    }
+
+
+def specs_text(snapshot: dict[str, Any]) -> str:
+    specs = collect_hardware_specs(snapshot)
+    gpu_block = "\n".join(specs["gpus"]) if specs["gpus"] else "н/д"
+    drives_block = "\n".join(specs["drives"]) if specs["drives"] else "н/д"
+    return (
+        f"CPU: {specs['cpu_name']}\n"
+        f"Ядра/потоки: {specs['cpu_cores']}/{specs['cpu_threads']}\n"
+        f"RAM: {human_bytes(specs['ram_total'])}\n"
+        f"Матплата: {specs['motherboard']}\n"
+        f"BIOS: {specs['bios']}\n"
+        f"GPU температура: {specs['gpu_temp']}\n"
+        f"Видеокарты:\n{gpu_block}\n\n"
+        f"Диски:\n{drives_block}"
+    )
+
+
 def list_drives() -> str:
     lines = get_drive_lines()
     return "\n".join(lines) or "Диски не найдены."
@@ -1110,6 +1243,17 @@ def trim_output(value: str, limit: int) -> tuple[str, bool]:
     if len(text) <= limit:
         return text, False
     return f"{text[: limit - 3].rstrip()}...", True
+
+
+def make_text_file_payload(prefix: str, stem: str, text: str) -> tuple[str | None, str | None]:
+    value = text.strip()
+    if not value:
+        return None, None
+    raw = value.encode("utf-8", errors="replace")
+    if len(raw) > SHELL_COMMAND_FILE_LIMIT_BYTES:
+        return None, None
+    safe_stem = re.sub(r"[^a-zA-Z0-9_.-]+", "_", stem).strip("._") or "output"
+    return f"{prefix}_{safe_stem}.txt", base64.b64encode(raw).decode("ascii")
 
 
 def build_powershell_command(command: str) -> str:
@@ -1164,6 +1308,18 @@ def run_shell_command(command: str) -> dict[str, Any]:
     stdout_preview, stdout_cut = trim_output(stdout_text, SHELL_COMMAND_PREVIEW_CHARS)
     stderr_preview, stderr_cut = trim_output(stderr_text, SHELL_COMMAND_PREVIEW_CHARS)
     duration = round(time.perf_counter() - started_at, 2)
+    file_name = None
+    file_b64 = None
+    combined_output = "\n\n".join(
+        chunk
+        for chunk in [
+            f"STDOUT\n{stdout_text.strip()}" if stdout_text.strip() else "",
+            f"STDERR\n{stderr_text.strip()}" if stderr_text.strip() else "",
+        ]
+        if chunk
+    )
+    if stdout_cut or stderr_cut or len(combined_output) > SHELL_COMMAND_PREVIEW_CHARS:
+        file_name, file_b64 = make_text_file_payload("cmd", "powershell_output", combined_output or command_text)
 
     summary_parts = [
         f"Shell: powershell.exe",
@@ -1207,6 +1363,8 @@ def run_shell_command(command: str) -> dict[str, Any]:
             "timeout_sec": SHELL_COMMAND_TIMEOUT_SECONDS,
             "truncated": stdout_cut or stderr_cut,
         },
+        "file_name": file_name,
+        "file_b64": file_b64,
     }
 
 
@@ -1330,6 +1488,82 @@ def restart_alias(alias: str) -> str:
     time.sleep(2)
     start_message = start_alias(alias)
     return f"{close_message}\n{start_message}"
+
+
+def file_search_roots() -> list[Path]:
+    home = Path.home()
+    roots = [
+        home / "Desktop",
+        home / "Downloads",
+        home / "Documents",
+        home / "Pictures",
+        home / "Videos",
+        BASE_DIR,
+    ]
+    return [root for root in roots if root.exists()]
+
+
+def candidate_file_score(path: Path, query_lower: str) -> tuple[int, int, int, str]:
+    path_lower = str(path).lower()
+    name_lower = path.name.lower()
+    exact_name = 0 if name_lower == query_lower else 1
+    name_contains = 0 if query_lower in name_lower else 1
+    path_contains = 0 if query_lower in path_lower else 1
+    return (exact_name, name_contains + path_contains, len(path_lower), path_lower)
+
+
+def find_file_match(query: str) -> Path:
+    raw_query = query.strip().strip('"')
+    candidate = Path(os.path.expandvars(raw_query))
+    if candidate.exists() and candidate.is_file():
+        return candidate
+
+    query_lower = raw_query.lower()
+    if not query_lower:
+        raise ValueError("После /file нужно передать имя или путь.")
+
+    excluded_parts = {"appdata", ".venv", "__pycache__", ".git", "node_modules"}
+    matches: list[Path] = []
+    for root in file_search_roots():
+        for current_root, dirs, files in os.walk(root):
+            dirs[:] = [name for name in dirs if name.lower() not in excluded_parts]
+            current_path = Path(current_root)
+            for file_name in files:
+                full_path = current_path / file_name
+                full_lower = str(full_path).lower()
+                if query_lower not in file_name.lower() and query_lower not in full_lower:
+                    continue
+                matches.append(full_path)
+                if len(matches) >= FILE_SEARCH_MAX_RESULTS:
+                    break
+            if len(matches) >= FILE_SEARCH_MAX_RESULTS:
+                break
+        if len(matches) >= FILE_SEARCH_MAX_RESULTS:
+            break
+    if not matches:
+        raise ValueError(f"Файл не найден: {query}")
+    matches.sort(key=lambda path: candidate_file_score(path, query_lower))
+    return matches[0]
+
+
+def send_found_file(query: str) -> dict[str, Any]:
+    path = find_file_match(query)
+    size_bytes = path.stat().st_size
+    if size_bytes > FILE_TRANSFER_LIMIT_BYTES:
+        raise ValueError(
+            f"Файл найден, но он слишком большой для отправки через Telegram: {path} ({human_bytes(size_bytes)})."
+        )
+    return {
+        "ok": True,
+        "message": f"Файл найден: {path}",
+        "data": {
+            "query": query,
+            "path": str(path),
+            "size_bytes": size_bytes,
+        },
+        "file_name": path.name,
+        "file_b64": base64.b64encode(path.read_bytes()).decode("ascii"),
+    }
 
 
 def get_screen_size() -> tuple[int, int]:
@@ -1910,6 +2144,66 @@ def render_popup_window(text: str) -> None:
     root.mainloop()
 
 
+def show_picture_popup(args: dict[str, Any]) -> dict[str, Any]:
+    if "tk" not in globals():
+        raise RuntimeError("Tkinter недоступен для показа изображения.")
+    image_bytes: bytes | None = None
+    if args.get("image_b64"):
+        image_bytes = base64.b64decode(str(args.get("image_b64")))
+    else:
+        image_url = str(args.get("url", "")).strip()
+        if not image_url:
+            raise ValueError("Не передана ссылка на изображение.")
+        response = requests.get(image_url, timeout=20)
+        response.raise_for_status()
+        image_bytes = response.content
+    if not image_bytes:
+        raise ValueError("Не удалось получить изображение.")
+
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    root = tk.Tk()
+    root.overrideredirect(True)
+    root.attributes("-topmost", True)
+    root.configure(bg="#000000")
+
+    screen_w = root.winfo_screenwidth()
+    screen_h = root.winfo_screenheight()
+    max_w = max(screen_w - 140, 320)
+    max_h = max(screen_h - 140, 240)
+    image.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
+    photo = ImageTk.PhotoImage(image)
+
+    width = image.width
+    height = image.height
+    pos_x = max((screen_w - width) // 2, 20)
+    pos_y = max((screen_h - height) // 2, 20)
+    root.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
+
+    canvas = tk.Canvas(root, width=width, height=height, highlightthickness=0, bd=0, bg="#000000")
+    canvas.pack(fill="both", expand=True)
+    canvas.create_image(width // 2, height // 2, image=photo)
+    close_size = 36
+    close_x1 = width - close_size - 12
+    close_y1 = 12
+    close_x2 = width - 12
+    close_y2 = 12 + close_size
+    canvas.create_oval(close_x1, close_y1, close_x2, close_y2, fill="#111827", outline="#e5e7eb", width=1)
+    canvas.create_text((close_x1 + close_x2) // 2, (close_y1 + close_y2) // 2, text="×", fill="#f9fafb", font=("Segoe UI", 18, "bold"))
+
+    def maybe_close(event: Any) -> None:
+        if close_x1 <= event.x <= close_x2 and close_y1 <= event.y <= close_y2:
+            root.destroy()
+
+    canvas.bind("<Button-1>", maybe_close)
+    root.after(TEXT_WINDOW_SECONDS * 1000, root.destroy)
+    root.mainloop()
+    return {
+        "ok": True,
+        "message": "Изображение показано на экране.",
+        "data": {"width": width, "height": height},
+    }
+
+
 def maybe_recover_wifi(last_attempt_at: float, reason: str, force: bool = False) -> tuple[float, str | None]:
     if not force and (time.time() - last_attempt_at) < WIFI_RECOVERY_COOLDOWN_SECONDS:
         return last_attempt_at, None
@@ -1955,6 +2249,12 @@ def handle_command(command: dict[str, Any], snapshot: dict[str, Any], session: r
                 "internet_ok": snapshot.get("internet_ok"),
             },
         }
+    if command_type == "specs":
+        return {
+            "ok": True,
+            "message": specs_text(snapshot),
+            "data": collect_hardware_specs(snapshot),
+        }
     if command_type == "drives":
         return {"ok": True, "message": list_drives(), "data": {}}
     if command_type == "services":
@@ -1988,6 +2288,9 @@ def handle_command(command: dict[str, Any], snapshot: dict[str, Any], session: r
     if command_type == "shell_cmd":
         command_text = str(args.get("command", "")).strip()
         return run_shell_command(command_text)
+    if command_type == "find_file":
+        query = str(args.get("query", "")).strip()
+        return send_found_file(query)
     if command_type == "run_alias":
         alias = str(args.get("alias", "")).strip().lower()
         return {"ok": True, "message": start_alias(alias), "data": {"alias": alias}}
@@ -2013,6 +2316,8 @@ def handle_command(command: dict[str, Any], snapshot: dict[str, Any], session: r
         return {"ok": True, "message": shutdown_pc(), "data": {}}
     if command_type == "show_text":
         return show_text_popup(str(args.get("text", "")))
+    if command_type == "show_picture":
+        return show_picture_popup(args)
     if command_type == "wifi_recover":
         return attempt_wifi_recovery_safe()
     if command_type == "self_update":
