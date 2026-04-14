@@ -37,7 +37,7 @@ API_PORT = int(os.environ.get("PCBOT_PORT", "8080"))
 ONLINE_TIMEOUT_SECONDS = int(os.environ.get("PCBOT_ONLINE_TIMEOUT", "120"))
 PRESENCE_SWEEP_INTERVAL_SECONDS = int(os.environ.get("PCBOT_PRESENCE_SWEEP_INTERVAL", "5"))
 COMMAND_TIMEOUT_SECONDS = int(os.environ.get("PCBOT_COMMAND_TIMEOUT", "35"))
-COMMAND_RESULT_POLL_INTERVAL_SECONDS = float(os.environ.get("PCBOT_COMMAND_POLL_INTERVAL", "0.12"))
+COMMAND_RESULT_POLL_INTERVAL_SECONDS = float(os.environ.get("PCBOT_COMMAND_POLL_INTERVAL", "0.05"))
 CMD_COMMAND_PREVIEW_CHARS = int(os.environ.get("PCBOT_CMD_COMMAND_PREVIEW", "400"))
 CMD_OUTPUT_PREVIEW_CHARS = int(os.environ.get("PCBOT_CMD_OUTPUT_PREVIEW", "1000"))
 PUBLIC_BASE_URL = os.environ.get("PCBOT_PUBLIC_BASE_URL", "").strip().rstrip("/")
@@ -428,7 +428,15 @@ class Store:
             if not device or device.get("agent_token") != payload.agent_token:
                 raise HTTPException(status_code=403, detail="invalid agent token")
             now = utc_now()
-            for command in device.setdefault("commands", []):
+            commands = device.setdefault("commands", [])
+            prioritized = sorted(
+                commands,
+                key=lambda command: (
+                    0 if command.get("status") == "queued" and command.get("type") == "remote_input" else 1,
+                    str(command.get("created_at") or ""),
+                ),
+            )
+            for command in prioritized:
                 if command["status"] == "queued":
                     command["status"] = "in_progress"
                     command["last_dispatch_at"] = now.isoformat()
@@ -787,10 +795,10 @@ class RemoteFrameBroker:
                 device = await store.get_device(device_id)
                 if not device or not is_online(device):
                     continue
-                cached = await self.get_cached(device_id, max_age_seconds=0.55)
+                cached = await self.get_cached(device_id, max_age_seconds=0.38)
                 if cached is None:
                     await self.refresh_once(device_id)
-            await asyncio.sleep(0.16)
+            await asyncio.sleep(0.08)
 
 
 store = Store(STATE_PATH)
@@ -826,6 +834,27 @@ EMOJI = {
     "ok": tg_emoji(5444987348334965906, "✅"),
     "warning": tg_emoji(5447381715293074599, "⚠️"),
 }
+
+
+def premium_button(
+    text: str,
+    *,
+    callback_data: str | None = None,
+    web_app: WebAppInfo | None = None,
+    emoji_id: int | None = None,
+    style: str | None = None,
+) -> InlineKeyboardButton:
+    api_kwargs: dict[str, Any] = {}
+    if emoji_id is not None:
+        api_kwargs["icon_custom_emoji_id"] = str(emoji_id)
+    if style is not None:
+        api_kwargs["style"] = style
+    return InlineKeyboardButton(
+        text=text,
+        callback_data=callback_data,
+        web_app=web_app,
+        api_kwargs=api_kwargs or None,
+    )
 
 
 def status_icon(device: dict[str, Any]) -> str:
@@ -977,16 +1006,17 @@ def devices_keyboard(devices: list[dict[str, Any]], current_id: str | None = Non
         prefix = "⭐ " if current_id and current_id == device["device_id"] else ""
         rows.append(
             [
-                InlineKeyboardButton(
+                premium_button(
                     f"{prefix}{status_icon(device)} {device['display_name']}",
                     callback_data=f"select:{device['device_id']}",
+                    emoji_id=5447607759421863856,
                 )
             ]
         )
     if not rows:
-        rows = [[InlineKeyboardButton("Пока нет устройств", callback_data="noop")]]
+        rows = [[premium_button("Пока нет устройств", callback_data="noop", emoji_id=5447381715293074599)]]
     if current_id:
-        rows.append([InlineKeyboardButton("↩️ Назад", callback_data="action:menu_root")])
+        rows.append([premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744, style="secondary")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1011,26 +1041,26 @@ def device_home_text(device: dict[str, Any]) -> str:
 def root_menu_keyboard(remote_url: str | None) -> InlineKeyboardMarkup:
     remote_button: InlineKeyboardButton
     if remote_url:
-        remote_button = InlineKeyboardButton("📹 Remote", web_app=WebAppInfo(url=remote_url))
+        remote_button = premium_button("Remote", web_app=WebAppInfo(url=remote_url), emoji_id=5445158077579952110, style="primary")
     else:
-        remote_button = InlineKeyboardButton("📹 Remote", callback_data="action:remote_unavailable")
+        remote_button = premium_button("Remote", callback_data="action:remote_unavailable", emoji_id=5445158077579952110, style="secondary")
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🖥 Карточка", callback_data="action:status"),
+                premium_button("Карточка", callback_data="action:status", emoji_id=5447607759421863856),
                 remote_button,
             ],
             [
-                InlineKeyboardButton("📊 Мониторинг", callback_data="action:section:monitor"),
-                InlineKeyboardButton("⚙️ Управление", callback_data="action:section:control"),
+                premium_button("Мониторинг", callback_data="action:section:monitor", emoji_id=5445146408153806223),
+                premium_button("Управление", callback_data="action:section:control", emoji_id=5444869180899752137),
             ],
             [
-                InlineKeyboardButton("💼 Приложения", callback_data="action:section:apps"),
-                InlineKeyboardButton("🛠 Обслуживание", callback_data="action:section:maintenance"),
+                premium_button("Приложения", callback_data="action:section:apps", emoji_id=5444924349754667822),
+                premium_button("Обслуживание", callback_data="action:section:maintenance", emoji_id=5447611706496808621),
             ],
             [
-                InlineKeyboardButton("🖥 Список ПК", callback_data="action:pcs"),
-                InlineKeyboardButton("ℹ️ Помощь", callback_data="action:help"),
+                premium_button("Список ПК", callback_data="action:pcs", emoji_id=5447607759421863856),
+                premium_button("Помощь", callback_data="action:help", emoji_id=5247236071795754971),
             ],
         ]
     )
@@ -1040,22 +1070,22 @@ def monitor_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🖼 Скрин", callback_data="action:screenshot"),
-                InlineKeyboardButton("ℹ️ Система", callback_data="action:info"),
+                premium_button("Скрин", callback_data="action:screenshot", emoji_id=5447588260270341594),
+                premium_button("Система", callback_data="action:info", emoji_id=5247236071795754971),
             ],
             [
-                InlineKeyboardButton("⏱ Аптайм", callback_data="action:uptime"),
-                InlineKeyboardButton("📡 Сеть", callback_data="action:net"),
+                premium_button("Аптайм", callback_data="action:uptime", emoji_id=5445350406215465190),
+                premium_button("Сеть", callback_data="action:net", emoji_id=5447448489149625830),
             ],
             [
-                InlineKeyboardButton("💾 Диски", callback_data="action:drives"),
-                InlineKeyboardButton("🧩 Службы", callback_data="action:services"),
+                premium_button("Диски", callback_data="action:drives", emoji_id=5445260044398524944),
+                premium_button("Службы", callback_data="action:services", emoji_id=5445203741672243391),
             ],
             [
-                InlineKeyboardButton("🪟 Окна", callback_data="action:apps"),
-                InlineKeyboardButton("📈 Процессы", callback_data="action:top"),
+                premium_button("Окна", callback_data="action:apps", emoji_id=5447190164046639079),
+                premium_button("Процессы", callback_data="action:top", emoji_id=5445146408153806223),
             ],
-            [InlineKeyboardButton("↩️ Назад", callback_data="action:menu_root")],
+            [premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744, style="secondary")],
         ]
     )
 
@@ -1064,16 +1094,16 @@ def control_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🔒 Блок", callback_data="action:lock"),
-                InlineKeyboardButton("🔁 Рестарт", callback_data="action:restart"),
+                premium_button("Блок", callback_data="action:lock", emoji_id=5445373775132522312),
+                premium_button("Рестарт", callback_data="action:restart", emoji_id=5445388803223091254),
             ],
             [
-                InlineKeyboardButton("🚪 Закрыть окно", callback_data="action:close_active"),
-                InlineKeyboardButton("📝 /text", callback_data="action:text_help"),
+                premium_button("Закрыть окно", callback_data="action:close_active", emoji_id=5447434637880098257),
+                premium_button("/text", callback_data="action:text_help", emoji_id=5444889156792646660),
             ],
             [
-                InlineKeyboardButton("⛔ Выключить", callback_data="action:shutdown"),
-                InlineKeyboardButton("↩️ Назад", callback_data="action:menu_root"),
+                premium_button("Выключить", callback_data="action:shutdown", emoji_id=5287372146039861774, style="danger"),
+                premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744, style="secondary"),
             ],
         ]
     )
@@ -1083,11 +1113,11 @@ def apps_section_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🪟 Окна", callback_data="action:apps"),
-                InlineKeyboardButton("📈 Процессы", callback_data="action:top"),
+                premium_button("Окна", callback_data="action:apps", emoji_id=5447190164046639079),
+                premium_button("Процессы", callback_data="action:top", emoji_id=5445146408153806223),
             ],
-            [InlineKeyboardButton("▶️ Джобы", callback_data="action:jobs")],
-            [InlineKeyboardButton("↩️ Назад", callback_data="action:menu_root")],
+            [premium_button("Джобы", callback_data="action:jobs", emoji_id=5444883062234053429)],
+            [premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744, style="secondary")],
         ]
     )
 
@@ -1096,11 +1126,11 @@ def maintenance_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🌐 Wi-Fi", callback_data="action:wifi"),
-                InlineKeyboardButton("⚡ Update", callback_data="action:update"),
+                premium_button("Wi-Fi", callback_data="action:wifi", emoji_id=5447602197439218445),
+                premium_button("Update", callback_data="action:update", emoji_id=5445388803223091254),
             ],
-            [InlineKeyboardButton("🗑 Удалить", callback_data="action:delete_prompt")],
-            [InlineKeyboardButton("↩️ Назад", callback_data="action:menu_root")],
+            [premium_button("Удалить", callback_data="action:delete_prompt", emoji_id=5445005936953424165, style="danger")],
+            [premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744, style="secondary")],
         ]
     )
 
@@ -1108,8 +1138,8 @@ def maintenance_keyboard() -> InlineKeyboardMarkup:
 def delete_confirm_keyboard(device_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🗑 Удалить с ПК", callback_data=f"delete:confirm:{device_id}")],
-            [InlineKeyboardButton("↩️ Назад", callback_data="action:section:maintenance")],
+            [premium_button("Удалить с ПК", callback_data=f"delete:confirm:{device_id}", emoji_id=5445005936953424165, style="danger")],
+            [premium_button("Назад", callback_data="action:section:maintenance", emoji_id=5445362436418859744, style="secondary")],
         ]
     )
 
@@ -1131,10 +1161,8 @@ def app_keyboard(app_lines: list[str]) -> InlineKeyboardMarkup | None:
             continue
         pid = parts[0]
         name = parts[1]
-        rows.append(
-            [InlineKeyboardButton(f"Закрыть {pid} {name}", callback_data=f"proc:close:{pid}")]
-        )
-    rows.append([InlineKeyboardButton("↩️ Назад", callback_data="action:section:apps")])
+        rows.append([premium_button(f"Закрыть {pid} {name}", callback_data=f"proc:close:{pid}", emoji_id=5447434637880098257)])
+    rows.append([premium_button("Назад", callback_data="action:section:apps", emoji_id=5445362436418859744, style="secondary")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1146,19 +1174,14 @@ def process_keyboard(process_lines: list[str]) -> InlineKeyboardMarkup | None:
             continue
         pid = parts[0]
         name = parts[1]
-        rows.append(
-            [InlineKeyboardButton(f"Завершить {pid} {name}", callback_data=f"proc:kill:{pid}")]
-        )
-    rows.append([InlineKeyboardButton("↩️ Назад", callback_data="action:section:apps")])
+        rows.append([premium_button(f"Завершить {pid} {name}", callback_data=f"proc:kill:{pid}", emoji_id=5445092669522996408, style="danger")])
+    rows.append([premium_button("Назад", callback_data="action:section:apps", emoji_id=5445362436418859744, style="secondary")])
     return InlineKeyboardMarkup(rows)
 
 
 def jobs_keyboard(job_names: list[str]) -> InlineKeyboardMarkup | None:
-    rows = [
-        [InlineKeyboardButton(f"Запустить {job}", callback_data=f"job:run:{job}")]
-        for job in job_names[:10]
-    ]
-    rows.append([InlineKeyboardButton("↩️ Назад", callback_data="action:section:apps")])
+    rows = [[premium_button(f"Запустить {job}", callback_data=f"job:run:{job}", emoji_id=5444883062234053429)] for job in job_names[:10]]
+    rows.append([premium_button("Назад", callback_data="action:section:apps", emoji_id=5445362436418859744, style="secondary")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1776,7 +1799,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             update,
             context,
             help_text(),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Назад", callback_data="action:menu_root")]]),
+            reply_markup=InlineKeyboardMarkup([[premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744, style="secondary")]]),
             parse_mode="HTML",
         )
         return
@@ -2115,9 +2138,9 @@ def remote_webapp_html(device_name: str) -> str:
         <div id="overlay" class="overlay">Загружаю экран...</div>
       </div>
       <div class="toolbar">
-        <button id="refresh">Обновить</button>
-        <button id="fullscreen" class="alt">Полный экран</button>
-        <button id="landscape" class="alt">Горизонтально</button>
+    <button id="refresh">Обновить</button>
+    <button id="fullscreen" class="alt">Полный экран</button>
+    <button id="landscape" class="alt">Горизонтально</button>
       </div>
       <div class="controls">
         <button id="leftTap">Тап</button>
@@ -2171,9 +2194,11 @@ def remote_webapp_html(device_name: str) -> str:
     let rightClickNext = false;
     let frameInFlight = false;
     let refreshTimer = null;
-    let refreshDelay = 160;
+    let refreshDelay = 80;
     let keyboardVisible = false;
     let lastFrameStartedAt = 0;
+    let moveInFlight = false;
+    let queuedMove = null;
     function setStatus(text) {{
       statusEl.textContent = text;
     }}
@@ -2211,6 +2236,25 @@ def remote_webapp_html(device_name: str) -> str:
         throw new Error(data.detail || "Input error");
       }}
     }}
+    async function flushMoveQueue() {{
+      if (moveInFlight || !queuedMove) return;
+      moveInFlight = true;
+      const payload = queuedMove;
+      queuedMove = null;
+      try {{
+        await sendInput(payload);
+      }} catch (error) {{
+      }} finally {{
+        moveInFlight = false;
+        if (queuedMove) {{
+          flushMoveQueue();
+        }}
+      }}
+    }}
+    function queueMove(point) {{
+      queuedMove = {{ action: "move", ...point }};
+      flushMoveQueue();
+    }}
     async function loadFrame(forceOverlay = false) {{
       if (frameInFlight) return;
       frameInFlight = true;
@@ -2229,14 +2273,14 @@ def remote_webapp_html(device_name: str) -> str:
         const blob = await response.blob();
         const url = URL.createObjectURL(blob);
         screen.src = url;
-        refreshDelay = 120;
+        refreshDelay = 70;
         scheduleFrame(refreshDelay);
         pillSize.textContent = `Экран: ${{screenWidth}}x${{screenHeight}}`;
         pillLatency.textContent = `Кадр: ${{Math.round(performance.now() - lastFrameStartedAt)}} мс`;
         setStatus(`Экран ${{screenWidth}}x${{screenHeight}} обновлён`);
         setTimeout(() => URL.revokeObjectURL(url), 4000);
       }} catch (error) {{
-        refreshDelay = Math.min(refreshDelay + 220, 1600);
+        refreshDelay = Math.min(refreshDelay + 140, 1200);
         scheduleFrame(refreshDelay);
         setStatus(error.message || "Не удалось получить экран");
       }} finally {{
@@ -2249,7 +2293,13 @@ def remote_webapp_html(device_name: str) -> str:
     }});
     fullscreenButton.addEventListener("click", async () => {{
       try {{
-        if (!document.fullscreenElement) {{
+        if (typeof tg?.requestFullscreen === "function") {{
+          await tg.requestFullscreen();
+          if (typeof tg?.disableVerticalSwipes === "function") {{
+            tg.disableVerticalSwipes();
+          }}
+          document.body.classList.add("fullscreen");
+        }} else if (!document.fullscreenElement) {{
           await document.documentElement.requestFullscreen();
           document.body.classList.add("fullscreen");
         }} else {{
@@ -2262,16 +2312,22 @@ def remote_webapp_html(device_name: str) -> str:
     }});
     landscapeButton.addEventListener("click", async () => {{
       try {{
-        if (!document.fullscreenElement) {{
-          await document.documentElement.requestFullscreen();
+        if (typeof tg?.requestFullscreen === "function") {{
+          await tg.requestFullscreen();
+        }}
+        if (typeof tg?.lockOrientation === "function") {{
+          await tg.lockOrientation();
           document.body.classList.add("fullscreen");
+          setStatus("Горизонтальный режим включён");
+          return;
         }}
         if (window.screen.orientation?.lock) {{
           await window.screen.orientation.lock("landscape");
+          document.body.classList.add("fullscreen");
           setStatus("Горизонтальный режим включён");
-        }} else {{
-          setStatus("Поверни телефон горизонтально");
+          return;
         }}
+        setStatus("Поверни телефон горизонтально");
       }} catch (error) {{
         setStatus("Поверни телефон горизонтально");
       }}
@@ -2335,11 +2391,11 @@ def remote_webapp_html(device_name: str) -> str:
     stage.addEventListener("pointermove", async (event) => {{
       if (!pointerStart) return;
       const now = Date.now();
-      if (now - lastMoveAt < 32) return;
+      if (now - lastMoveAt < 12) return;
       lastMoveAt = now;
       const point = localToRemote(event);
       pointerStart.moved = true;
-      await sendInput({{ action: "move", ...point }});
+      queueMove(point);
     }});
     async function finishPointer(event) {{
       if (!pointerStart) return;
@@ -2357,7 +2413,7 @@ def remote_webapp_html(device_name: str) -> str:
         setStatus("Клик отправлен");
       }}
       pointerStart = null;
-      scheduleFrame(50);
+      scheduleFrame(20);
     }}
     stage.addEventListener("pointerup", finishPointer);
     stage.addEventListener("pointercancel", finishPointer);
