@@ -993,7 +993,7 @@ def help_text() -> str:
         "/closeapp <pid|name> - закрыть окно процесса\n"
         "/kill <pid|name> - завершить процесс\n"
         "/restartapp <alias> - перезапустить программу\n"
-        "/lock - заблокировать ПК\n"
+        "/lock - заблокировать Windows и показать экран входа\n"
         "/restart - перезагрузить ПК\n"
         "/shutdown - выключить ПК\n\n"
         "<b>Обслуживание</b>\n\n"
@@ -1379,6 +1379,8 @@ async def send_text(
         except BadRequest as exc:
             if "message is not modified" in str(exc).lower():
                 return
+        except Exception:
+            pass
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=text,

