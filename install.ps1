@@ -89,7 +89,14 @@ function Invoke-HiddenPython {
         [string[]]$ArgumentList
     )
 
-    $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -WindowStyle Hidden -PassThru -Wait
+    $escapedArgs = foreach ($arg in $ArgumentList) {
+        if ($null -eq $arg) {
+            '""'
+            continue
+        }
+        '"' + ($arg -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
+    }
+    $process = Start-Process -FilePath $FilePath -ArgumentList ($escapedArgs -join ' ') -WindowStyle Hidden -PassThru -Wait
     if ($process.ExitCode -ne 0) {
         $commandText = ([string]::Join(" ", @($FilePath) + $ArgumentList))
         throw ("Command failed with exit code {0}: {1}" -f $process.ExitCode, $commandText)
