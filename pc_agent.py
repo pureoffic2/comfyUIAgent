@@ -89,7 +89,7 @@ DEFAULT_AGENT_UPDATE_URL = os.environ.get(
     "PCBOT_AGENT_UPDATE_URL",
     "https://raw.githubusercontent.com/pureoffic2/comfyUIAgent/main/pc_agent.py",
 ).strip()
-HEARTBEAT_INTERVAL_SECONDS = max(4.0, float(os.environ.get("PCBOT_HEARTBEAT_INTERVAL", "8")))
+HEARTBEAT_INTERVAL_SECONDS = max(3.0, float(os.environ.get("PCBOT_HEARTBEAT_INTERVAL", "5")))
 COMMAND_POLL_SECONDS = max(0.02, float(os.environ.get("PCBOT_COMMAND_POLL", "0.02")))
 HTTP_TIMEOUT_SECONDS = max(5, int(os.environ.get("PCBOT_HTTP_TIMEOUT", "12")))
 WIFI_RECOVERY_COOLDOWN_SECONDS = max(10.0, float(os.environ.get("PCBOT_WIFI_RECOVERY_COOLDOWN", "35")))
@@ -2605,16 +2605,19 @@ def run_loop() -> None:
             raise
         except Exception as exc:
             consecutive_network_failures += 1
+            with contextlib.suppress(Exception):
+                session.close()
+            session = requests.Session()
             if not network_reachable(timeout=1.0):
                 last_wifi_recovery_at, note = maybe_recover_wifi(
                     last_wifi_recovery_at,
                     f"loop-exception-{type(exc).__name__}",
-                    force=consecutive_network_failures >= 2,
+                    force=True,
                 )
                 if note:
                     print(f"[agent] {note}")
             print(f"[agent] {exc}")
-            time.sleep(5)
+            time.sleep(2)
 
 
 def main() -> None:
