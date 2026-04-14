@@ -14,8 +14,10 @@ import os
 import platform
 import py_compile
 import re
+import secrets
 import shlex
 import socket
+import string
 import subprocess
 import sys
 import tempfile
@@ -155,6 +157,14 @@ JOB_ALIASES: dict[str, dict[str, Any]] = {
     "comfy_portal": {
         "command": r"D:\ComfyUI_windows_portable_nvidia\ComfyUI_windows_portable\ComfyPortal.exe",
         "cwd": r"D:\ComfyUI_windows_portable_nvidia\ComfyUI_windows_portable",
+    },
+    "wsl_ubuntu_ssh_start": {
+        "kind": "managed",
+        "title": "WSL Ubuntu SSH start",
+    },
+    "wsl_ubuntu_ssh_stop": {
+        "kind": "managed",
+        "title": "WSL Ubuntu SSH stop",
     },
 }
 
@@ -1380,10 +1390,16 @@ def start_alias(alias: str) -> str:
     return f"Запущено: {alias}."
 
 
-def run_job(alias: str) -> str:
+def run_job(alias: str, snapshot: dict[str, Any]) -> dict[str, Any]:
     job = JOB_ALIASES.get(alias)
     if not job:
         raise ValueError(f"Неизвестная джоба: {alias}")
+    if str(job.get("kind", "")).strip().lower() == "managed":
+        if alias == "wsl_ubuntu_ssh_start":
+            return start_wsl_ubuntu_ssh(snapshot)
+        if alias == "wsl_ubuntu_ssh_stop":
+            return stop_wsl_ubuntu_ssh()
+        raise ValueError(f"Неизвестная управляемая джоба: {alias}")
     command_line = os.path.expandvars(str(job["command"]))
     cwd = os.path.expandvars(str(job.get("cwd", BASE_DIR)))
     if command_line.lower().endswith(".exe") and " " not in command_line.strip():
@@ -1395,7 +1411,7 @@ def run_job(alias: str) -> str:
             cwd=cwd,
             **hidden_subprocess_kwargs(),
         )
-    return f"Джоба запущена: {alias}."
+    return {"ok": True, "message": f"Джоба запущена: {alias}.", "data": {"alias": alias}}
 
 def close_windows_for_pid(pid: int) -> int:
     closed_hwnds: set[int] = set()
@@ -1564,6 +1580,169 @@ def send_found_file(query: str) -> dict[str, Any]:
         },
         "file_name": path.name,
         "file_b64": base64.b64encode(path.read_bytes()).decode("ascii"),
+    }
+
+
+def run_hidden_capture(command: list[str], timeout: int = 60) -> tuple[int, str, str]:
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=False,
+        timeout=timeout,
+        shell=False,
+        **hidden_subprocess_kwargs(),
+    )
+    return completed.returncode, decode_process_output(completed.stdout), decode_process_output(completed.stderr)
+
+
+def list_wsl_distros() -> list[str]:
+    code, stdout, stderr = run_hidden_capture(["wsl.exe", "-l", "-q"], timeout=25)
+    if code != 0:
+        combined = (stdout + "\n" + stderr).strip()
+        raise ValueError(combined or "Не удалось получить список WSL-дистрибутивов.")
+    return [line.strip() for line in stdout.replace("\x00", "").splitlines() if line.strip()]
+
+
+def select_ubuntu_distro() -> str | None:
+    distros = list_wsl_distros()
+    for distro in distros:
+        if distro.lower().startswith("ubuntu"):
+            return distro
+    return None
+
+
+def random_plain_password(length: int = 18) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def run_wsl_bash(distro: str, script: str, *, user: str = "root", timeout: int = 240) -> tuple[int, str, str]:
+    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    command = ["wsl.exe", "-d", distro]
+    if user:
+        command += ["-u", user]
+    command += ["--", "bash", "-lc", f"echo {shlex.quote(encoded)} | base64 -d | bash"]
+    return run_hidden_capture(command, timeout=timeout)
+
+
+def ensure_ubuntu_wsl() -> dict[str, Any]:
+    distro = select_ubuntu_distro()
+    if distro:
+        return {"installed": True, "distro": distro, "message": f"Найдена WSL Ubuntu: {distro}."}
+
+    code, stdout, stderr = run_hidden_capture(["wsl.exe", "--install", "-d", "Ubuntu"], timeout=45)
+    combined = "\n".join(part.strip() for part in [stdout, stderr] if part.strip()).strip()
+    if code == 0:
+        return {
+            "installed": False,
+            "distro": "Ubuntu",
+            "message": "Запущена установка Ubuntu для WSL. После завершения установки и возможной перезагрузки запусти джобу ещё раз.",
+            "details": combined,
+        }
+    raise ValueError(combined or "Не удалось установить Ubuntu для WSL. Возможно, нужны права администратора или перезагрузка Windows.")
+
+
+def start_wsl_ubuntu_ssh(snapshot: dict[str, Any]) -> dict[str, Any]:
+    ensured = ensure_ubuntu_wsl()
+    if not ensured.get("installed"):
+        return {
+            "ok": True,
+            "message": str(ensured.get("message") or "Установка Ubuntu для WSL запущена."),
+            "data": {"installed": False, "details": ensured.get("details", "")},
+        }
+
+    distro = str(ensured["distro"])
+    username = "portal"
+    password = random_plain_password()
+    port = 22022
+    provision_script = f"""
+set -e
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y openssh-server sudo
+id -u {shlex.quote(username)} >/dev/null 2>&1 || useradd -m -s /bin/bash {shlex.quote(username)}
+echo {shlex.quote(username + ":" + password)} | chpasswd
+usermod -aG sudo {shlex.quote(username)}
+mkdir -p /run/sshd
+python3 - <<'PY'
+from pathlib import Path
+import re
+path = Path('/etc/ssh/sshd_config')
+text = path.read_text()
+def set_value(source, key, value):
+    pattern = rf'(?m)^#?\\s*{{re.escape(key)}}\\s+.*$'
+    if re.search(pattern, source):
+        return re.sub(pattern, f'{{key}} {{value}}', source)
+    return source.rstrip() + f'\\n{{key}} {{value}}\\n'
+for key, value in [
+    ('Port', '{port}'),
+    ('PasswordAuthentication', 'yes'),
+    ('PermitRootLogin', 'no'),
+    ('PubkeyAuthentication', 'yes'),
+]:
+    text = set_value(text, key, value)
+path.write_text(text)
+PY
+pkill sshd >/dev/null 2>&1 || true
+/usr/sbin/sshd -p {port}
+hostname -I | awk '{{print $1}}'
+"""
+    code, stdout, stderr = run_wsl_bash(distro, provision_script, user="root", timeout=420)
+    if code != 0:
+        combined = "\n".join(part.strip() for part in [stdout, stderr] if part.strip()).strip()
+        raise ValueError(combined or "Не удалось запустить SSH в Ubuntu WSL.")
+
+    wsl_ip = next((line.strip() for line in stdout.splitlines() if line.strip()), "")
+    state = load_state()
+    state["wsl_ssh"] = {
+        "enabled": True,
+        "distro": distro,
+        "username": username,
+        "password": password,
+        "port": port,
+        "wsl_ip": wsl_ip,
+        "updated_at": int(time.time()),
+    }
+    save_state(state)
+    host_ip = next((str(item).strip() for item in snapshot.get("ip_addresses", []) if str(item).strip()), "127.0.0.1")
+    message = (
+        "Ubuntu WSL SSH готов.\n"
+        f"Distro: {distro}\n"
+        f"Логин: {username}\n"
+        f"Пароль: {password}\n"
+        f"Порт: {port}\n"
+        f"Windows host: {host_ip}\n"
+        f"WSL IP: {wsl_ip or 'н/д'}\n"
+        f"Команда: ssh -p {port} {username}@127.0.0.1"
+    )
+    return {
+        "ok": True,
+        "message": message,
+        "data": {
+            "distro": distro,
+            "username": username,
+            "password": password,
+            "port": port,
+            "host_ip": host_ip,
+            "wsl_ip": wsl_ip,
+        },
+    }
+
+
+def stop_wsl_ubuntu_ssh() -> dict[str, Any]:
+    state = load_state()
+    session_info = state.get("wsl_ssh", {})
+    distro = str(session_info.get("distro") or select_ubuntu_distro() or "Ubuntu")
+    code, stdout, stderr = run_wsl_bash(distro, "pkill sshd >/dev/null 2>&1 || true", user="root", timeout=60)
+    state.pop("wsl_ssh", None)
+    save_state(state)
+    if code != 0:
+        combined = "\n".join(part.strip() for part in [stdout, stderr] if part.strip()).strip()
+        raise ValueError(combined or "Не удалось остановить SSH в Ubuntu WSL.")
+    return {
+        "ok": True,
+        "message": f"SSH в Ubuntu WSL остановлен. Distro: {distro}.",
+        "data": {"distro": distro},
     }
 
 
@@ -2294,7 +2473,7 @@ def handle_command(command: dict[str, Any], snapshot: dict[str, Any], session: r
         return {"ok": True, "message": start_alias(alias), "data": {"alias": alias}}
     if command_type == "run_job":
         alias = str(args.get("alias", "")).strip().lower()
-        return {"ok": True, "message": run_job(alias), "data": {"alias": alias}}
+        return run_job(alias, snapshot)
     if command_type == "close_app":
         target = str(args.get("target") or args.get("alias") or "").strip()
         return {"ok": True, "message": close_process(target), "data": {"target": target}}
