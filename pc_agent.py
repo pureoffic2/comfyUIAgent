@@ -95,7 +95,7 @@ HTTP_TIMEOUT_SECONDS = max(5, int(os.environ.get("PCBOT_HTTP_TIMEOUT", "12")))
 WIFI_RECOVERY_COOLDOWN_SECONDS = max(10.0, float(os.environ.get("PCBOT_WIFI_RECOVERY_COOLDOWN", "35")))
 WIFI_CONNECT_SETTLE_SECONDS = max(3.0, float(os.environ.get("PCBOT_WIFI_CONNECT_SETTLE", "6")))
 TEXT_WINDOW_SECONDS = max(5, int(os.environ.get("PCBOT_TEXT_WINDOW_SECONDS", "25")))
-AGENT_VERSION = "1.6.0"
+AGENT_VERSION = "1.6.1"
 SHELL_COMMAND_TIMEOUT_SECONDS = 25
 SHELL_COMMAND_CWD = str(Path.home())
 SHELL_COMMAND_PREVIEW_CHARS = 1600
@@ -1655,15 +1655,19 @@ def start_wsl_ubuntu_ssh(snapshot: dict[str, Any]) -> dict[str, Any]:
     username = "portal"
     password = random_plain_password()
     port = 22022
+    host_ip = next((str(item).strip() for item in snapshot.get("ip_addresses", []) if str(item).strip()), "127.0.0.1")
     provision_script = f"""
 set -e
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y openssh-server sudo
+apt-get update -y >/dev/null 2>&1 || true
+apt-get install -y openssh-server sudo >/dev/null 2>&1
 id -u {shlex.quote(username)} >/dev/null 2>&1 || useradd -m -s /bin/bash {shlex.quote(username)}
 echo {shlex.quote(username + ":" + password)} | chpasswd
 usermod -aG sudo {shlex.quote(username)}
-mkdir -p /run/sshd
+mkdir -p /run/sshd /var/run/sshd /tmp/systemportal-sshd
+chmod 755 /run/sshd /var/run/sshd /tmp/systemportal-sshd
+chown root:root /run/sshd /var/run/sshd /tmp/systemportal-sshd
+ssh-keygen -A >/dev/null 2>&1 || true
 python3 - <<'PY'
 from pathlib import Path
 import re
@@ -1679,21 +1683,25 @@ for key, value in [
     ('PasswordAuthentication', 'yes'),
     ('PermitRootLogin', 'no'),
     ('PubkeyAuthentication', 'yes'),
+    ('UsePAM', 'no'),
+    ('ChallengeResponseAuthentication', 'no'),
 ]:
     text = set_value(text, key, value)
 path.write_text(text)
 PY
 pkill sshd >/dev/null 2>&1 || true
-/usr/sbin/sshd -p {port}
+/usr/sbin/sshd -t
+/usr/sbin/sshd -p {port} -o PidFile=/tmp/systemportal-sshd/sshd.pid
 hostname -I | awk '{{print $1}}'
 """
     code, stdout, stderr = run_wsl_bash(distro, provision_script, user="root", timeout=420)
     if code != 0:
         combined = "\n".join(part.strip() for part in [stdout, stderr] if part.strip()).strip()
+        if "Missing privilege separation directory" in combined:
+            raise ValueError("WSL Ubuntu ответила, но sshd не стартовал. Обычно помогает перезапуск WSL: `wsl --shutdown`, затем запусти джобу ещё раз.")
         raise ValueError(combined or "Не удалось запустить SSH в Ubuntu WSL.")
 
     wsl_ip = next((line.strip() for line in stdout.splitlines() if line.strip()), "")
-    host_ip = next((str(item).strip() for item in snapshot.get("ip_addresses", []) if str(item).strip()), "127.0.0.1")
     state = load_state()
     state["wsl_ssh"] = {
         "enabled": True,
@@ -1734,7 +1742,7 @@ def stop_wsl_ubuntu_ssh() -> dict[str, Any]:
     state = load_state()
     session_info = state.get("wsl_ssh", {})
     distro = str(session_info.get("distro") or select_ubuntu_distro() or "Ubuntu")
-    code, stdout, stderr = run_wsl_bash(distro, "pkill sshd >/dev/null 2>&1 || true", user="root", timeout=60)
+    code, stdout, stderr = run_wsl_bash(distro, "pkill sshd >/dev/null 2>&1 || true; rm -f /tmp/systemportal-sshd/sshd.pid >/dev/null 2>&1 || true", user="root", timeout=60)
     state.pop("wsl_ssh", None)
     save_state(state)
     if code != 0:
@@ -1750,11 +1758,18 @@ def stop_wsl_ubuntu_ssh() -> dict[str, Any]:
 def wsl_ssh_info() -> dict[str, Any]:
     state = load_state()
     info = state.get("wsl_ssh")
+    distro = select_ubuntu_distro()
+    if not distro and not info:
+        return {
+            "ok": True,
+            "message": "Ubuntu в WSL ещё не установлена или WSL не готов.",
+            "data": {},
+        }
     if not info:
         return {
             "ok": True,
-            "message": "WLS SSH сейчас не запущен.",
-            "data": {},
+            "message": f"Ubuntu в WSL найдена ({distro}), но SSH сейчас не запущен.",
+            "data": {"distro": distro, "enabled": False},
         }
     message = (
         "WLS SSH активен.\n"
