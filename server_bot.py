@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import html
+import io
 import json
 import os
 import platform
@@ -811,7 +812,7 @@ telegram_app: Application | None = None
 
 
 def tg_emoji(emoji_id: int, fallback: str) -> str:
-    return f'<tg-emoji emoji-id="{emoji_id}">{html.escape(fallback)}</tg-emoji>'
+    return ""
 
 
 EMOJI = {
@@ -856,7 +857,7 @@ def premium_button(
 
 
 def status_icon(device: dict[str, Any]) -> str:
-    return EMOJI["ok"] if is_online(device) else EMOJI["warning"]
+    return "ONLINE" if is_online(device) else "OFFLINE"
 
 
 def device_button_text(device: dict[str, Any], current_id: str | None = None) -> str:
@@ -869,9 +870,9 @@ def device_card(device: dict[str, Any]) -> str:
     counters = command_counters(device)
     last_seen = device.get("last_seen")
     lines = [
-        f"<b>{EMOJI['app']} SystemPortal</b>",
+        "<b>SystemPortal</b>",
         f"<b>{html.escape(device.get('display_name', device['device_id']))}</b>",
-        f"<b>Статус</b>: {html.escape(status_icon(device))} <code>{status_badge(device)}</code> | {html.escape(status_label(device))}",
+        f"<b>Статус</b>: <code>{status_badge(device)}</code> | {html.escape(status_label(device))}",
         f"<b>ID</b>: <code>{html.escape(device.get('device_id', 'n/a'))}</code>",
         f"<b>Heartbeat</b>: {html.escape(format_time(last_seen))} | {html.escape(format_relative_age(last_seen))}",
         f"<b>Версия агента</b>: <code>{html.escape(str(device.get('agent_version', 'n/a')))}</code>",
@@ -969,7 +970,7 @@ def snapshot_text(device: dict[str, Any], command_type: str) -> str | None:
 
 def help_text() -> str:
     return (
-        f"{EMOJI['app']} <b>SystemPortal</b>\n"
+        "<b>SystemPortal</b>\n"
         "Структурированная панель для ПК, мини-апп удалённого экрана и быстрые команды.\n\n"
         "<b>Основное</b>\n\n"
         "/pcs - список устройств и их статус\n"
@@ -1002,6 +1003,7 @@ def help_text() -> str:
         "/text <текст> - показать отдельное окно с текстом на экране ПК\n\n"
         "/pic <ссылка> или reply на фото - показать картинку на экране ПК\n\n"
         "/file <имя или путь> - найти файл и отправить его в Telegram\n\n"
+        "/wls - открыть панель WLS / Ubuntu SSH\n\n"
         "Уведомления об онлайне и оффлайне приходят автоматически. Mini App удалённого экрана доступен из меню выбранного ПК и поднимается через автотуннель."
     )
 
@@ -1035,9 +1037,9 @@ def public_remote_supported() -> bool:
 
 def device_home_text(device: dict[str, Any]) -> str:
     return (
-        f"<b>{EMOJI['pc']} Панель ПК</b>\n"
+        "<b>Панель ПК</b>\n"
         f"ПК: <b>{html.escape(device.get('display_name', device['device_id']))}</b>\n"
-        f"Статус: {html.escape(status_icon(device))} <code>{status_badge(device)}</code>\n"
+        f"Статус: <code>{status_badge(device)}</code>\n"
         f"Heartbeat: {html.escape(format_relative_age(device.get('last_seen')))}\n\n"
         "Выбери раздел ниже. Всё меню работает в одном сообщении без спама."
     )
@@ -1061,9 +1063,10 @@ def root_menu_keyboard(remote_url: str | None) -> InlineKeyboardMarkup:
             ],
             [
                 premium_button("Приложения", callback_data="action:section:apps", emoji_id=5444924349754667822),
-                premium_button("Обслуживание", callback_data="action:section:maintenance", emoji_id=5447611706496808621),
+                premium_button("WLS", callback_data="action:section:wls", emoji_id=5445224894386172410),
             ],
             [
+                premium_button("Обслуживание", callback_data="action:section:maintenance", emoji_id=5447611706496808621),
                 premium_button("Список ПК", callback_data="action:pcs", emoji_id=5447607759421863856),
                 premium_button("Помощь", callback_data="action:help", emoji_id=5247236071795754971),
             ],
@@ -1141,6 +1144,21 @@ def maintenance_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def wls_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                premium_button("Статус", callback_data="action:wls_info", emoji_id=5247236071795754971),
+                premium_button("Запуск", callback_data="action:wls_start", emoji_id=5444883062234053429),
+            ],
+            [
+                premium_button("Стоп", callback_data="action:wls_stop", emoji_id=5445092669522996408),
+                premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744),
+            ],
+        ]
+    )
+
+
 def delete_confirm_keyboard(device_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -1152,10 +1170,10 @@ def delete_confirm_keyboard(device_id: str) -> InlineKeyboardMarkup:
 
 def delete_prompt_text(device: dict[str, Any]) -> str:
     return (
-        f"<b>{EMOJI['delete']} Удаление SystemPortal</b>\n"
+        "<b>Удаление SystemPortal</b>\n"
         f"Устройство: <b>{html.escape(device.get('display_name', device['device_id']))}</b>\n"
         f"ID: <code>{html.escape(device.get('device_id', 'n/a'))}</code>\n\n"
-        "После подтверждения устройство сразу исчезнет из списка. Если агент онлайн, бот ещё и отправит команду на полное самоудаление."
+        "После подтверждения устройство исчезнет из списка. Если агент онлайн, он удалит папку установки, автозапуск, временные инсталляторы и старые следы SchoolPro/SystemPortal."
     )
 
 
@@ -1409,6 +1427,11 @@ def command_reply_markup(
             reply_markup = jobs_keyboard([str(item) for item in items])
     if command_type in {"info", "uptime", "net", "drives", "services", "screenshot", "specs"}:
         reply_markup = monitor_keyboard()
+    if command_type == "wsl_info":
+        reply_markup = wls_keyboard()
+    alias_value = str(payload.get("data", {}).get("alias", "")).strip().lower()
+    if command_type == "run_job" and alias_value.startswith("wsl_ubuntu_ssh_"):
+        reply_markup = wls_keyboard()
     if command_type in {"close_app", "kill_process", "run_job", "restart_app", "run_alias", "top", "apps", "jobs"} and reply_markup is None:
         reply_markup = apps_section_keyboard()
     if command_type in {"lock_pc", "restart_pc", "shutdown_pc", "show_text", "close_foreground_window"}:
@@ -1452,20 +1475,22 @@ async def send_result(
     reply_markup = command_reply_markup(command_type, payload)
     file_path = payload.get("file_path")
     if file_path and Path(file_path).exists():
-        with Path(file_path).open("rb") as handle:
-            suffix = Path(file_path).suffix.lower()
-            if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
-                await context.bot.send_photo(
-                    chat_id=update.effective_chat.id,
-                    photo=handle,
-                    caption=payload.get("message") or None,
-                )
-            else:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=handle,
-                    filename=payload.get("file_name"),
-                )
+        suffix = Path(file_path).suffix.lower()
+        raw = Path(file_path).read_bytes()
+        buffer = io.BytesIO(raw)
+        buffer.name = payload.get("file_name") or Path(file_path).name
+        if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=buffer,
+                caption=payload.get("message") or None,
+            )
+        else:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=buffer,
+                filename=buffer.name,
+            )
         if command_type == "find_file":
             await send_text(update, context, payload.get("message", "").strip() or "Файл отправлен.", reply_markup=maintenance_keyboard())
         return
@@ -1783,6 +1808,32 @@ async def specs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await run_for_current(update, context, "specs", use_cache=False)
 
 
+async def wls_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await run_for_current(update, context, "wsl_info", use_cache=False)
+
+
+async def wls_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await authorize(update) or update.effective_chat is None:
+        return
+    device = await selected_device(update.effective_chat.id)
+    if not device:
+        await send_text(update, context, "ПК не выбран. Сначала открой /pcs.")
+        return
+    result = await run_and_wait(device["device_id"], "run_job", {"alias": "wsl_ubuntu_ssh_start"})
+    await send_result(update, context, "run_job", result)
+
+
+async def wls_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await authorize(update) or update.effective_chat is None:
+        return
+    device = await selected_device(update.effective_chat.id)
+    if not device:
+        await send_text(update, context, "ПК не выбран. Сначала открой /pcs.")
+        return
+    result = await run_and_wait(device["device_id"], "run_job", {"alias": "wsl_ubuntu_ssh_stop"})
+    await send_result(update, context, "run_job", result)
+
+
 async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         if update.effective_message:
@@ -1832,6 +1883,18 @@ async def restartapp_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await run_for_current(update, context, "restart_app", {"alias": context.args[0]})
 
 
+async def wls_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await authorize(update):
+        return
+    await send_text(
+        update,
+        context,
+        section_text("WLS", "Ubuntu в WSL, запуск SSH, получение логина и остановка сессии."),
+        reply_markup=wls_keyboard(),
+        parse_mode="HTML",
+    )
+
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
@@ -1872,6 +1935,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     if data == "action:specs":
         await specs_command(update, context)
+        return
+    if data == "action:wls_info":
+        await wls_info_command(update, context)
+        return
+    if data == "action:wls_start":
+        await wls_start_command(update, context)
+        return
+    if data == "action:wls_stop":
+        await wls_stop_command(update, context)
         return
     if data == "action:menu_root":
         current = await selected_device(update.effective_chat.id)
@@ -1928,6 +2000,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context,
             section_text("Приложения", "Окна, процессы и джобы выбранного ПК."),
             reply_markup=apps_section_keyboard(),
+            parse_mode="HTML",
+        )
+        return
+    if data == "action:section:wls":
+        await send_text(
+            update,
+            context,
+            section_text("WLS", "Ubuntu в WSL, запуск SSH, получение логина и остановка сессии."),
+            reply_markup=wls_keyboard(),
             parse_mode="HTML",
         )
         return
@@ -2682,6 +2763,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("text", text_command))
     app.add_handler(CommandHandler("pic", pic_command))
     app.add_handler(CommandHandler("file", file_command))
+    app.add_handler(CommandHandler("wls", wls_command))
     app.add_handler(CommandHandler("cmd", cmd_command))
     app.add_handler(CommandHandler("run", run_command))
     app.add_handler(CommandHandler("job", job_command))

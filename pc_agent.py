@@ -1693,6 +1693,7 @@ hostname -I | awk '{{print $1}}'
         raise ValueError(combined or "Не удалось запустить SSH в Ubuntu WSL.")
 
     wsl_ip = next((line.strip() for line in stdout.splitlines() if line.strip()), "")
+    host_ip = next((str(item).strip() for item in snapshot.get("ip_addresses", []) if str(item).strip()), "127.0.0.1")
     state = load_state()
     state["wsl_ssh"] = {
         "enabled": True,
@@ -1700,11 +1701,11 @@ hostname -I | awk '{{print $1}}'
         "username": username,
         "password": password,
         "port": port,
+        "host_ip": host_ip,
         "wsl_ip": wsl_ip,
         "updated_at": int(time.time()),
     }
     save_state(state)
-    host_ip = next((str(item).strip() for item in snapshot.get("ip_addresses", []) if str(item).strip()), "127.0.0.1")
     message = (
         "Ubuntu WSL SSH готов.\n"
         f"Distro: {distro}\n"
@@ -1744,6 +1745,28 @@ def stop_wsl_ubuntu_ssh() -> dict[str, Any]:
         "message": f"SSH в Ubuntu WSL остановлен. Distro: {distro}.",
         "data": {"distro": distro},
     }
+
+
+def wsl_ssh_info() -> dict[str, Any]:
+    state = load_state()
+    info = state.get("wsl_ssh")
+    if not info:
+        return {
+            "ok": True,
+            "message": "WLS SSH сейчас не запущен.",
+            "data": {},
+        }
+    message = (
+        "WLS SSH активен.\n"
+        f"Distro: {info.get('distro', 'Ubuntu')}\n"
+        f"Логин: {info.get('username', 'portal')}\n"
+        f"Пароль: {info.get('password', 'н/д')}\n"
+        f"Порт: {info.get('port', '22022')}\n"
+        f"Windows host: {info.get('host_ip', '127.0.0.1')}\n"
+        f"WSL IP: {info.get('wsl_ip', 'н/д')}\n"
+        f"Команда: ssh -p {info.get('port', '22022')} {info.get('username', 'portal')}@127.0.0.1"
+    )
+    return {"ok": True, "message": message, "data": dict(info)}
 
 
 def get_screen_size() -> tuple[int, int]:
@@ -2079,6 +2102,11 @@ def build_self_uninstall_script(entry_name: str, target_dir: Path) -> Path:
             f'del "{startup_dir()}\\SchoolPro*.vbs" >nul 2>&1',
             f'del "{startup_dir()}\\SafePc*.cmd" >nul 2>&1',
             f'del "{startup_dir()}\\SafePc*.vbs" >nul 2>&1',
+            f'del "{tempfile.gettempdir()}\\systemportal-install*.ps1" >nul 2>&1',
+            f'del "{tempfile.gettempdir()}\\schoolpro-install*.ps1" >nul 2>&1',
+            f'del "{tempfile.gettempdir()}\\systemportal_cleanup_*.cmd" >nul 2>&1',
+            f'rmdir /s /q "{localappdata_dir()}\\SchoolPro" >nul 2>&1',
+            f'rmdir /s /q "{localappdata_dir()}\\SystemPortal" >nul 2>&1',
         ]
     )
     cleanup_script = Path(tempfile.gettempdir()) / f"systemportal_cleanup_{os.getpid()}.cmd"
@@ -2495,6 +2523,8 @@ def handle_command(command: dict[str, Any], snapshot: dict[str, Any], session: r
         return show_text_popup(str(args.get("text", "")))
     if command_type == "show_picture":
         return show_picture_popup(args)
+    if command_type == "wsl_info":
+        return wsl_ssh_info()
     if command_type == "wifi_recover":
         return attempt_wifi_recovery_safe()
     if command_type == "self_update":
