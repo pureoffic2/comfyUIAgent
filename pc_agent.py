@@ -60,21 +60,21 @@ DEFAULT_AGENT_UPDATE_URL = os.environ.get(
     "PCBOT_AGENT_UPDATE_URL",
     "https://raw.githubusercontent.com/pureoffic2/comfyUIAgent/main/pc_agent.py",
 ).strip()
-HEARTBEAT_INTERVAL_SECONDS = max(5.0, float(os.environ.get("PCBOT_HEARTBEAT_INTERVAL", "10")))
-COMMAND_POLL_SECONDS = max(0.12, float(os.environ.get("PCBOT_COMMAND_POLL", "0.18")))
+HEARTBEAT_INTERVAL_SECONDS = max(4.0, float(os.environ.get("PCBOT_HEARTBEAT_INTERVAL", "8")))
+COMMAND_POLL_SECONDS = max(0.05, float(os.environ.get("PCBOT_COMMAND_POLL", "0.08")))
 HTTP_TIMEOUT_SECONDS = max(5, int(os.environ.get("PCBOT_HTTP_TIMEOUT", "12")))
 WIFI_RECOVERY_COOLDOWN_SECONDS = max(10.0, float(os.environ.get("PCBOT_WIFI_RECOVERY_COOLDOWN", "35")))
 WIFI_CONNECT_SETTLE_SECONDS = max(3.0, float(os.environ.get("PCBOT_WIFI_CONNECT_SETTLE", "6")))
 TEXT_WINDOW_SECONDS = max(5, int(os.environ.get("PCBOT_TEXT_WINDOW_SECONDS", "25")))
-AGENT_VERSION = "1.4.0"
+AGENT_VERSION = "1.5.0"
 SHELL_COMMAND_TIMEOUT_SECONDS = 25
 SHELL_COMMAND_CWD = str(Path.home())
 SHELL_COMMAND_PREVIEW_CHARS = 1600
-DEFAULT_STARTUP_ENTRY_NAME = "SchoolProAgent"
-LEGACY_STARTUP_ENTRY_NAMES = ("SafePcTelegramAgent",)
-REMOTE_FRAME_MAX_WIDTH = 1280
-REMOTE_FRAME_MAX_HEIGHT = 720
-REMOTE_FRAME_QUALITY = 48
+DEFAULT_STARTUP_ENTRY_NAME = "SystemPortalAgent"
+LEGACY_STARTUP_ENTRY_NAMES = ("SafePcTelegramAgent", "SchoolProAgent")
+REMOTE_FRAME_MAX_WIDTH = 960
+REMOTE_FRAME_MAX_HEIGHT = 540
+REMOTE_FRAME_QUALITY = 34
 STANDARD_SCREENSHOT_MAX_WIDTH = 1600
 STANDARD_SCREENSHOT_MAX_HEIGHT = 900
 STANDARD_SCREENSHOT_QUALITY = 72
@@ -82,11 +82,16 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 SM_CXSCREEN = 0
 SM_CYSCREEN = 1
 INPUT_MOUSE = 0
+INPUT_KEYBOARD = 1
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 MOUSEEVENTF_RIGHTDOWN = 0x0008
 MOUSEEVENTF_RIGHTUP = 0x0010
 MOUSEEVENTF_WHEEL = 0x0800
+KEYEVENTF_KEYUP = 0x0002
+VK_CONTROL = 0x11
+VK_V = 0x56
+VK_RETURN = 0x0D
 WLAN_CLIENT_VERSION_LONGHORN = 2
 WLAN_AVAILABLE_NETWORK_CONNECTED = 0x00000001
 WLAN_AVAILABLE_NETWORK_HAS_PROFILE = 0x00000002
@@ -232,8 +237,18 @@ class MOUSEINPUT(ctypes.Structure):
     ]
 
 
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", ctypes.wintypes.WORD),
+        ("wScan", ctypes.wintypes.WORD),
+        ("dwFlags", ctypes.wintypes.DWORD),
+        ("time", ctypes.wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
 class INPUT_UNION(ctypes.Union):
-    _fields_ = [("mi", MOUSEINPUT)]
+    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT)]
 
 
 class INPUT(ctypes.Structure):
@@ -361,6 +376,8 @@ def legacy_startup_cmd_path(entry_name: str | None = None) -> Path:
 
 def autostart_scan_patterns() -> tuple[str, ...]:
     return (
+        "SystemPortal*.cmd",
+        "SystemPortal*.vbs",
         "SchoolPro*.cmd",
         "SchoolPro*.vbs",
         "SafePc*.cmd",
@@ -383,7 +400,7 @@ def cleanup_legacy_startup_files() -> None:
             text = ""
             with contextlib.suppress(OSError):
                 text = candidate.read_text(encoding="utf-8", errors="ignore").lower()
-            if "pc_agent.py" not in text and "schoolpro" not in candidate.name.lower() and "safepc" not in candidate.name.lower():
+            if "pc_agent.py" not in text and "schoolpro" not in candidate.name.lower() and "safepc" not in candidate.name.lower() and "systemportal" not in candidate.name.lower():
                 continue
             with contextlib.suppress(FileNotFoundError):
                 candidate.unlink()
@@ -393,6 +410,7 @@ def cleanup_legacy_scheduled_tasks() -> None:
     task_names = {
         DEFAULT_STARTUP_ENTRY_NAME,
         *LEGACY_STARTUP_ENTRY_NAMES,
+        "SystemPortalAgentTest",
         "SchoolProAgentTest",
         "SchoolProAgentTest2",
     }
@@ -729,17 +747,21 @@ def current_wifi_connection() -> tuple[str | None, int | None]:
 
 
 def get_wifi_status(include_connection: bool = False) -> dict[str, Any]:
+    connected_profile = None
+    connected_signal = None
+    if include_connection:
+        connected_profile, connected_signal = current_wifi_connection()
     info: dict[str, Any] = {
         "profiles": [],
         "visible_profiles": [],
-        "connected_profile": None,
-        "connected_signal": None,
-        "available": wlan_available() or bool(list_wifi_profiles()),
+        "connected_profile": connected_profile,
+        "connected_signal": connected_signal,
+        "available": False,
         "internet_ok": network_reachable(timeout=1.0),
     }
-    info["profiles"] = list_wifi_profiles()
-    if include_connection:
-        info["connected_profile"], info["connected_signal"] = current_wifi_connection()
+    profiles = list_wifi_profiles()
+    info["profiles"] = profiles
+    info["available"] = bool(profiles or connected_profile)
     return info
 
 
@@ -747,15 +769,6 @@ def connect_wifi_profile(profile_name: str) -> None:
     stripped = profile_name.strip()
     if not stripped:
         raise ValueError("Пустое имя Wi-Fi профиля.")
-    if wlan_available():
-        try:
-            with WlanClient() as client:
-                interfaces = client.interfaces()
-                if interfaces:
-                    client.connect_profile(interfaces[0].InterfaceGuid, stripped)
-                    return
-        except Exception:
-            pass
     completed = subprocess.run(
         ["netsh", "wlan", "connect", f"name={stripped}"],
         check=False,
@@ -819,9 +832,12 @@ def attempt_wifi_recovery() -> dict[str, Any]:
 def attempt_wifi_recovery_safe() -> dict[str, Any]:
     status = get_wifi_status(include_connection=True)
     if not status.get("available"):
-        raise ValueError("На этом ПК не найден Wi-Fi адаптер или Windows не даёт доступ к WLAN API.")
+        raise ValueError("На этом ПК не найден Wi-Fi адаптер или не видны сохранённые Wi-Fi профили.")
 
     ordered = [str(name) for name in status.get("profiles", []) if str(name).strip()]
+    current = str(status.get("connected_profile") or "").strip()
+    if current:
+        ordered = [current, *[name for name in ordered if name.lower() != current.lower()]]
     if not ordered:
         raise ValueError("Не найдены сохранённые Wi-Fi профили для переподключения.")
 
@@ -1368,6 +1384,74 @@ def send_mouse_flags(flags: int, data: int = 0) -> None:
         raise OSError("Не удалось отправить мышиное событие.")
 
 
+def get_keyboard_sender(vk_code: int, flags: int = 0) -> INPUT:
+    return INPUT(
+        type=INPUT_KEYBOARD,
+        union=INPUT_UNION(
+            ki=KEYBDINPUT(
+                wVk=vk_code,
+                wScan=0,
+                dwFlags=flags,
+                time=0,
+                dwExtraInfo=0,
+            )
+        ),
+    )
+
+
+def tap_key(vk_code: int) -> None:
+    press = get_keyboard_sender(vk_code)
+    release = get_keyboard_sender(vk_code, KEYEVENTF_KEYUP)
+    count = SendInput(2, (INPUT * 2)(press, release), ctypes.sizeof(INPUT))
+    if count != 2:
+        raise OSError("Не удалось отправить нажатие клавиши.")
+
+
+def chord_ctrl_v() -> None:
+    events = (INPUT * 4)(
+        get_keyboard_sender(VK_CONTROL),
+        get_keyboard_sender(VK_V),
+        get_keyboard_sender(VK_V, KEYEVENTF_KEYUP),
+        get_keyboard_sender(VK_CONTROL, KEYEVENTF_KEYUP),
+    )
+    count = SendInput(4, events, ctypes.sizeof(INPUT))
+    if count != 4:
+        raise OSError("Не удалось вставить текст через Ctrl+V.")
+
+
+def set_clipboard_text(text: str) -> None:
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-Command",
+            "Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+        ],
+        input=text,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        capture_output=True,
+        timeout=8,
+        **hidden_subprocess_kwargs(),
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            decode_process_output(completed.stderr)
+            or decode_process_output(completed.stdout)
+            or "Set-Clipboard failed"
+        )
+
+
+def type_text_into_active_window(text: str) -> None:
+    value = text.replace("\r\n", "\n").strip()
+    if not value:
+        raise ValueError("Пустой текст для ввода.")
+    set_clipboard_text(value)
+    time.sleep(0.06)
+    chord_ctrl_v()
+
+
 def clamp_coordinate(value: float, minimum: int, maximum: int) -> int:
     return max(minimum, min(int(round(value)), maximum))
 
@@ -1383,6 +1467,22 @@ def move_cursor(x: float, y: float) -> tuple[int, int]:
 
 def perform_remote_input(args: dict[str, Any]) -> dict[str, Any]:
     action = str(args.get("action", "")).strip().lower()
+    if action == "type_text":
+        value = str(args.get("text", ""))
+        type_text_into_active_window(value)
+        return {
+            "ok": True,
+            "message": "Текст отправлен в активное окно.",
+            "data": {"action": action, "length": len(value)},
+        }
+    if action == "key_enter":
+        tap_key(VK_RETURN)
+        return {
+            "ok": True,
+            "message": "Enter отправлен в активное окно.",
+            "data": {"action": action},
+        }
+
     x = float(args.get("x", 0))
     y = float(args.get("y", 0))
     button = str(args.get("button", "left")).strip().lower() or "left"
@@ -1391,7 +1491,7 @@ def perform_remote_input(args: dict[str, Any]) -> dict[str, Any]:
     if action == "move":
         return {
             "ok": True,
-            "message": f"Курсор перемещён в {target_x}, {target_y}.",
+            "message": "",
             "data": {"x": target_x, "y": target_y, "action": action},
         }
     if action == "click":
@@ -1523,7 +1623,7 @@ def remove_startup_entry() -> None:
 
 
 def managed_install_dir() -> bool:
-    return BASE_DIR.name.lower() == "schoolpro" or (BASE_DIR / "INSTALL.txt").exists()
+    return BASE_DIR.name.lower() in {"schoolpro", "systemportal"} or (BASE_DIR / "INSTALL.txt").exists()
 
 
 def build_self_uninstall_script(entry_name: str, target_dir: Path) -> Path:
@@ -1534,13 +1634,15 @@ def build_self_uninstall_script(entry_name: str, target_dir: Path) -> Path:
     cleanup_commands.extend(f'del "{legacy_startup_cmd_path(name)}" >nul 2>&1' for name in cleanup_names)
     cleanup_commands.extend(
         [
+            f'del "{startup_dir()}\\SystemPortal*.cmd" >nul 2>&1',
+            f'del "{startup_dir()}\\SystemPortal*.vbs" >nul 2>&1',
             f'del "{startup_dir()}\\SchoolPro*.cmd" >nul 2>&1',
             f'del "{startup_dir()}\\SchoolPro*.vbs" >nul 2>&1',
             f'del "{startup_dir()}\\SafePc*.cmd" >nul 2>&1',
             f'del "{startup_dir()}\\SafePc*.vbs" >nul 2>&1',
         ]
     )
-    cleanup_script = Path(tempfile.gettempdir()) / f"schoolpro_cleanup_{os.getpid()}.cmd"
+    cleanup_script = Path(tempfile.gettempdir()) / f"systemportal_cleanup_{os.getpid()}.cmd"
     cleanup_script.write_text(
         "\r\n".join(
             [
@@ -1565,7 +1667,7 @@ def build_self_uninstall_script(entry_name: str, target_dir: Path) -> Path:
 
 def uninstall_self() -> dict[str, Any]:
     if not managed_install_dir():
-        raise ValueError("Самоудаление разрешено только для установленной папки SchoolPro.")
+        raise ValueError("Самоудаление разрешено только для установленной папки SystemPortal.")
 
     state = load_state()
     entry_name = str(state.get("startup_entry_name") or startup_entry_name()).strip() or DEFAULT_STARTUP_ENTRY_NAME
@@ -1578,7 +1680,7 @@ def uninstall_self() -> dict[str, Any]:
     )
     return {
         "ok": True,
-        "message": "Удаление SchoolPro запущено. Агент завершит работу и очистит установку.",
+        "message": "Удаление SystemPortal запущено. Агент завершит работу и очистит установку.",
         "data": {
             "entry_name": entry_name,
             "target_dir": str(BASE_DIR),
@@ -1596,7 +1698,7 @@ def parse_remote_version(source_text: str) -> str | None:
 
 def write_temp_python_source(source_text: str) -> Path:
     temp_dir = Path(tempfile.gettempdir())
-    temp_path = temp_dir / f"schoolpro_agent_update_{os.getpid()}.py"
+    temp_path = temp_dir / f"systemportal_agent_update_{os.getpid()}.py"
     temp_path.write_text(source_text, encoding="utf-8")
     return temp_path
 
@@ -1628,7 +1730,7 @@ def update_install_summary() -> None:
     state = load_state()
     summary = "\n".join(
         [
-            "SchoolPro installed.",
+            "SystemPortal installed.",
             "",
             "Folder:",
             str(BASE_DIR),
@@ -1708,31 +1810,11 @@ def perform_self_update(session: requests.Session) -> dict[str, Any]:
     }
 
 
-def encode_popup_text(text: str) -> str:
-    return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii")
-
-
-def decode_popup_text(encoded: str) -> str:
-    padding = "=" * (-len(encoded) % 4)
-    return base64.urlsafe_b64decode((encoded + padding).encode("ascii")).decode("utf-8")
-
-
 def show_text_popup(text: str) -> dict[str, Any]:
     value = text.strip()
     if not value:
         raise ValueError("После /text нужно передать текст.")
-    launcher = ensure_hidden_python()
-    subprocess.Popen(
-        [
-            str(launcher),
-            str(Path(__file__).resolve()),
-            "--show-text-b64",
-            encode_popup_text(value),
-        ],
-        shell=False,
-        cwd=str(BASE_DIR),
-        **hidden_subprocess_kwargs(),
-    )
+    render_popup_window(value)
     return {
         "ok": True,
         "message": "Текстовое окно показано на экране.",
@@ -1741,55 +1823,34 @@ def show_text_popup(text: str) -> dict[str, Any]:
 
 
 def render_popup_window(text: str) -> None:
-    if "tk" not in globals():
-        raise RuntimeError("Tkinter недоступен для показа текста.")
-    root = tk.Tk()
-    root.title("SchoolPro")
-    root.configure(bg="#0f172a")
-    root.attributes("-topmost", True)
-    root.minsize(520, 220)
-    screen_w = root.winfo_screenwidth()
-    screen_h = root.winfo_screenheight()
-    width = min(760, max(520, screen_w - 160))
-    height = min(320, max(220, screen_h // 3))
-    pos_x = max((screen_w - width) // 2, 20)
-    pos_y = max((screen_h - height) // 3, 20)
-    root.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
-
-    frame = tk.Frame(root, bg="#0f172a", padx=24, pady=24)
-    frame.pack(fill="both", expand=True)
-    title = tk.Label(
-        frame,
-        text="Сообщение",
-        fg="#f8fafc",
-        bg="#0f172a",
-        font=("Segoe UI Semibold", 18),
+    lines = [line[:220] for line in text.replace("\r\n", "\n").splitlines()][:24]
+    printable = "\r\n".join(lines) or text[:220]
+    script_path = Path(tempfile.gettempdir()) / f"systemportal_text_{os.getpid()}_{int(time.time())}.cmd"
+    script_path.write_text(
+        "\r\n".join(
+            [
+                "@echo off",
+                "chcp 65001 >nul",
+                "title SystemPortal",
+                "mode con cols=92 lines=24",
+                "color 0F",
+                "echo.",
+                "echo ======================= SystemPortal =======================",
+                "echo.",
+                *[f"echo {line}" for line in printable.splitlines()],
+                "echo.",
+                f"timeout /t {TEXT_WINDOW_SECONDS} /nobreak >nul",
+                f'del "{script_path}" >nul 2>&1',
+                "",
+            ]
+        ),
+        encoding="utf-8",
     )
-    title.pack(anchor="w")
-    label = tk.Label(
-        frame,
-        text=text,
-        fg="#e2e8f0",
-        bg="#0f172a",
-        justify="left",
-        wraplength=width - 60,
-        font=("Segoe UI", 22),
+    subprocess.Popen(
+        ["cmd.exe", "/c", "start", "SystemPortal", "cmd.exe", "/k", str(script_path)],
+        shell=False,
+        cwd=str(BASE_DIR),
     )
-    label.pack(fill="both", expand=True, pady=(18, 12))
-    close_button = tk.Button(
-        frame,
-        text="Закрыть",
-        command=root.destroy,
-        bg="#38bdf8",
-        fg="#082f49",
-        relief="flat",
-        padx=18,
-        pady=8,
-        font=("Segoe UI Semibold", 12),
-    )
-    close_button.pack(anchor="e")
-    root.after(TEXT_WINDOW_SECONDS * 1000, root.destroy)
-    root.mainloop()
 
 
 def maybe_recover_wifi(last_attempt_at: float, reason: str, force: bool = False) -> tuple[float, str | None]:
@@ -1905,7 +1966,7 @@ def handle_command(command: dict[str, Any], snapshot: dict[str, Any], session: r
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Safe Telegram PC agent")
+    parser = argparse.ArgumentParser(description="SystemPortal Telegram PC agent")
     parser.add_argument("--set-name", help="Override the display name used on the server")
     parser.add_argument("--set-update-url", help="Persist the URL used for self-updates")
     parser.add_argument(
@@ -1913,7 +1974,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Create a per-user startup entry for logon startup",
     )
-    parser.add_argument("--show-text-b64", help="Internal: show a text popup without console")
     return parser.parse_args()
 
 
@@ -1990,10 +2050,6 @@ def run_loop() -> None:
 
 def main() -> None:
     args = parse_args()
-
-    if args.show_text_b64:
-        render_popup_window(decode_popup_text(args.show_text_b64))
-        return
 
     state = load_state()
     changed_state = False

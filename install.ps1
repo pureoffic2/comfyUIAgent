@@ -3,9 +3,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$AgentUrl,
 
-    [string]$InstallDir = "$env:LOCALAPPDATA\SchoolPro",
+    [string]$InstallDir = "$env:LOCALAPPDATA\SystemPortal",
 
-    [string]$TaskName = "SchoolProAgent",
+    [string]$TaskName = "SystemPortalAgent",
 
     [string]$DisplayName = "",
 
@@ -150,7 +150,7 @@ shell.Run Chr(34) & "$venvPython" & Chr(34) & " " & Chr(34) & "$agentPath" & Chr
 }
 
 $installSummary = @"
-SchoolPro installed.
+SystemPortal installed.
 
 Folder:
 $installPath
