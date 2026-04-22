@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$AgentUrl,
 
-    [string]$InstallDir = "$env:LOCALAPPDATA\SystemPortal",
+    [string]$InstallDir = "",
 
     [string]$TaskName = "SystemPortalAgent",
 
@@ -51,6 +51,50 @@ function Invoke-Download {
     }
 
     Invoke-WebRequest @params
+}
+
+function Resolve-InstallDirectory {
+    param([string]$RequestedPath)
+
+    if ($RequestedPath -and $RequestedPath.Trim()) {
+        return [System.IO.Path]::GetFullPath(
+            [Environment]::ExpandEnvironmentVariables($RequestedPath)
+        )
+    }
+
+    $basePath = $env:LOCALAPPDATA
+    if (-not ($basePath -and $basePath.Trim())) {
+        $basePath = Join-Path $env:USERPROFILE "AppData\Local"
+    }
+    if (-not ($basePath -and $basePath.Trim())) {
+        $basePath = Join-Path ([System.IO.Path]::GetTempPath()) "SystemPortal"
+        return [System.IO.Path]::GetFullPath($basePath)
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path $basePath "SystemPortal"))
+}
+
+function Ensure-Directory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
+}
+
+function Reset-BrokenVenv {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$VenvPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$VenvPython
+    )
+
+    if ((Test-Path -LiteralPath $VenvPath) -and -not (Test-Path -LiteralPath $VenvPython)) {
+        Write-Step "Removing incomplete virtual environment"
+        Remove-Item -LiteralPath $VenvPath -Recurse -Force
+    }
 }
 
 function Resolve-PythonCommand {
@@ -105,7 +149,7 @@ function Invoke-HiddenPython {
 
 Enable-Tls12IfPossible
 $pythonCmd = Resolve-PythonCommand
-$installPath = [System.IO.Path]::GetFullPath($InstallDir)
+$installPath = Resolve-InstallDirectory -RequestedPath $InstallDir
 $venvPath = Join-Path $installPath ".venv"
 $agentPath = Join-Path $installPath "pc_agent.py"
 $readmePath = Join-Path $installPath "INSTALL.txt"
@@ -113,13 +157,22 @@ $venvPython = Join-Path $venvPath "Scripts\python.exe"
 $venvPythonw = Join-Path $venvPath "Scripts\pythonw.exe"
 
 Write-Step "Preparing install folder $installPath"
-New-Item -ItemType Directory -Path $installPath -Force | Out-Null
+Ensure-Directory -Path $installPath
+Ensure-Directory -Path (Join-Path $installPath "logs")
+Ensure-Directory -Path (Join-Path $installPath "data")
+Ensure-Directory -Path (Join-Path $installPath "tmp")
 
 Write-Step "Downloading agent"
 Invoke-Download -Uri $AgentUrl -OutFile $agentPath
 
-Write-Step "Creating virtual environment"
-Invoke-Checked -Command ($pythonCmd + @("-m", "venv", $venvPath))
+Reset-BrokenVenv -VenvPath $venvPath -VenvPython $venvPython
+if (-not (Test-Path -LiteralPath $venvPython)) {
+    Write-Step "Creating virtual environment"
+    Invoke-Checked -Command ($pythonCmd + @("-m", "venv", $venvPath))
+}
+else {
+    Write-Step "Using existing virtual environment"
+}
 
 Write-Step "Upgrading pip"
 Invoke-Checked -Command @($venvPython, "-m", "pip", "install", "--upgrade", "pip")
