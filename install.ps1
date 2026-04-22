@@ -1,7 +1,6 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$AgentUrl,
+    [string]$AgentUrl = "https://raw.githubusercontent.com/pureoffic2/comfyUIAgent/main/pc_agent.py",
 
     [string]$InstallDir = "",
 
@@ -148,6 +147,9 @@ function Invoke-HiddenPython {
 }
 
 Enable-Tls12IfPossible
+if (-not ($AgentUrl -and $AgentUrl.Trim())) {
+    $AgentUrl = "https://raw.githubusercontent.com/pureoffic2/comfyUIAgent/main/pc_agent.py"
+}
 $pythonCmd = Resolve-PythonCommand
 $installPath = Resolve-InstallDirectory -RequestedPath $InstallDir
 $venvPath = Join-Path $installPath ".venv"
