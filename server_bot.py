@@ -1216,7 +1216,7 @@ def delete_confirm_keyboard(device_id: str) -> InlineKeyboardMarkup:
 def delete_prompt_text(device: dict[str, Any]) -> str:
     return (
         "<b>Удаление SystemPortal</b>\n"
-        f"Устройство: <b>{html.escape(device.get('display_name', device['device_id']))}</b>\n"
+        f"Устройство: <b>{html.escape(effective_display_name(device))}</b>\n"
         f"ID: <code>{html.escape(device.get('device_id', 'n/a'))}</code>\n\n"
         "После подтверждения устройство исчезнет из списка. Если агент онлайн, он удалит папку установки, автозапуск, временные инсталляторы и старые следы SchoolPro/SystemPortal."
     )
@@ -1589,7 +1589,7 @@ async def delete_device_installation(
     await send_text(
         update,
         context,
-        f"<b>{EMOJI['delete']} Устройство удалено</b>\n<b>{html.escape(device['display_name'])}</b> скрыто из списка.\n{html.escape(note)}",
+        f"<b>{EMOJI['delete']} Устройство удалено</b>\n<b>{html.escape(effective_display_name(device))}</b> скрыто из списка.\n{html.escape(note)}",
         reply_markup=devices_keyboard(devices, current["device_id"] if current else None),
         parse_mode="HTML",
     )
@@ -2723,7 +2723,7 @@ async def remote_webapp(session_id: str) -> HTMLResponse:
     device = await store.get_device(str(session.get("device_id")))
     if not device:
         raise HTTPException(status_code=404, detail="device not found")
-    return HTMLResponse(remote_webapp_html(str(device.get("display_name", device["device_id"]))))
+    return HTMLResponse(remote_webapp_html(effective_display_name(device)))
 
 
 @api.get("/remote/{session_id}/api/frame")
