@@ -237,6 +237,29 @@ class Store:
         device.setdefault("presence_changed_at", registered_at if inferred_status == "offline" else last_seen or registered_at)
         device.setdefault("last_online_at", last_seen if inferred_status == "online" else None)
         device.setdefault("last_offline_at", registered_at if inferred_status == "offline" else None)
+        device.setdefault("bot_label", None)
+
+    def _make_unique_display_name(
+        self,
+        devices: dict[str, dict[str, Any]],
+        *,
+        requested_name: str,
+        device_id: str,
+    ) -> str:
+        base = requested_name.strip() or device_id
+        occupied = {
+            str(item.get("display_name") or "").strip().lower()
+            for other_id, item in devices.items()
+            if other_id != device_id
+        }
+        if base.lower() not in occupied:
+            return base
+        counter = 1
+        while True:
+            candidate = f"{base} {counter}"
+            if candidate.lower() not in occupied:
+                return candidate
+            counter += 1
 
     def _load(self) -> dict[str, Any]:
         ensure_dirs()
@@ -303,10 +326,15 @@ class Store:
         async with self.lock:
             devices = self.state.setdefault("devices", {})
             created = payload.device_id not in devices
+            unique_name = self._make_unique_display_name(
+                devices,
+                requested_name=payload.display_name.strip() or payload.hostname,
+                device_id=payload.device_id,
+            )
             if created:
                 devices[payload.device_id] = {
                     "device_id": payload.device_id,
-                    "display_name": payload.display_name.strip() or payload.hostname,
+                    "display_name": unique_name,
                     "hostname": payload.hostname,
                     "agent_version": payload.agent_version,
                     "agent_token": secrets.token_urlsafe(24),
@@ -322,13 +350,24 @@ class Store:
                 }
             else:
                 device = devices[payload.device_id]
-                device["display_name"] = payload.display_name.strip() or payload.hostname
+                device["display_name"] = unique_name
                 device["hostname"] = payload.hostname
                 device["agent_version"] = payload.agent_version
                 device["updated_at"] = utc_now().isoformat()
                 self._ensure_device_defaults(device)
             self._save_unlocked()
             return json.loads(json.dumps(devices[payload.device_id])), created
+
+    async def set_bot_label(self, device_id: str, value: str | None) -> dict[str, Any] | None:
+        async with self.lock:
+            device = self.state.get("devices", {}).get(device_id)
+            if not device:
+                return None
+            trimmed = (value or "").strip()
+            device["bot_label"] = trimmed or None
+            device["updated_at"] = utc_now().isoformat()
+            self._save_unlocked()
+            return json.loads(json.dumps(device))
 
     async def heartbeat(self, payload: HeartbeatRequest) -> tuple[dict[str, Any], bool]:
         async with self.lock:
@@ -860,9 +899,13 @@ def status_icon(device: dict[str, Any]) -> str:
     return "ONLINE" if is_online(device) else "OFFLINE"
 
 
+def effective_display_name(device: dict[str, Any]) -> str:
+    return str(device.get("bot_label") or device.get("display_name") or device.get("device_id") or "ПК")
+
+
 def device_button_text(device: dict[str, Any], current_id: str | None = None) -> str:
     selected = "ACTIVE | " if current_id and current_id == device["device_id"] else ""
-    return f"{selected}{status_badge(device)} | {device['display_name']}"
+    return f"{selected}{status_badge(device)} | {effective_display_name(device)}"
 
 
 def device_card(device: dict[str, Any]) -> str:
@@ -871,7 +914,7 @@ def device_card(device: dict[str, Any]) -> str:
     last_seen = device.get("last_seen")
     lines = [
         "<b>SystemPortal</b>",
-        f"<b>{html.escape(device.get('display_name', device['device_id']))}</b>",
+        f"<b>{html.escape(effective_display_name(device))}</b>",
         f"<b>Статус</b>: <code>{status_badge(device)}</code> | {html.escape(status_label(device))}",
         f"<b>ID</b>: <code>{html.escape(device.get('device_id', 'n/a'))}</code>",
         f"<b>Heartbeat</b>: {html.escape(format_time(last_seen))} | {html.escape(format_relative_age(last_seen))}",
@@ -923,7 +966,7 @@ def snapshot_text(device: dict[str, Any], command_type: str) -> str | None:
     updated_at = format_time(device.get("last_seen"))
     if command_type == "info":
         return (
-            f"ПК: {device.get('display_name', device['device_id'])}\n"
+            f"ПК: {effective_display_name(device)}\n"
             f"Обновлено: {updated_at}\n"
             f"Хост: {snapshot.get('hostname', 'н/д')}\n"
             f"Пользователь: {snapshot.get('username', 'н/д')}\n"
@@ -977,6 +1020,7 @@ def help_text() -> str:
         "/select &lt;name_or_id&gt; - выбрать активный ПК\n"
         "/status - подробная карточка выбранного ПК\n"
         "/menu - главное меню выбранного ПК\n\n"
+        "/rename &lt;имя&gt; - задать подпись ПК только для бота\n\n"
         "<b>Мониторинг</b>\n\n"
         "/info - сводка по системе\n"
         "/uptime - аптайм\n"
@@ -1038,7 +1082,7 @@ def public_remote_supported() -> bool:
 def device_home_text(device: dict[str, Any]) -> str:
     return (
         "<b>Панель ПК</b>\n"
-        f"ПК: <b>{html.escape(device.get('display_name', device['device_id']))}</b>\n"
+        f"ПК: <b>{html.escape(effective_display_name(device))}</b>\n"
         f"Статус: <code>{status_badge(device)}</code>\n"
         f"Heartbeat: {html.escape(format_relative_age(device.get('last_seen')))}\n\n"
         "Выбери раздел ниже. Всё меню работает в одном сообщении без спама."
@@ -1138,6 +1182,7 @@ def maintenance_keyboard() -> InlineKeyboardMarkup:
                 premium_button("Wi-Fi", callback_data="action:wifi", emoji_id=5447602197439218445),
                 premium_button("Update", callback_data="action:update", emoji_id=5445388803223091254),
             ],
+            [premium_button("Переименовать", callback_data="action:rename_help", emoji_id=5445128296276718145)],
             [premium_button("Удалить", callback_data="action:delete_prompt", emoji_id=5445005936953424165)],
             [premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744)],
         ]
@@ -1240,6 +1285,7 @@ async def selected_device(chat_id: int, explicit: str | None = None) -> dict[str
             values = {
                 str(device.get("device_id", "")).lower(),
                 str(device.get("display_name", "")).lower(),
+                str(device.get("bot_label", "")).lower(),
                 str(device.get("hostname", "")).lower(),
             }
             if needle in values:
@@ -1253,6 +1299,7 @@ async def selected_device(chat_id: int, explicit: str | None = None) -> dict[str
                 for value in {
                     str(device.get("device_id", "")).lower(),
                     str(device.get("display_name", "")).lower(),
+                    str(device.get("bot_label", "")).lower(),
                     str(device.get("hostname", "")).lower(),
                 }
             )
@@ -1577,13 +1624,13 @@ async def pcs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"Всего: <code>{len(devices)}</code> | Онлайн: <code>{online_count}</code> | Оффлайн: <code>{len(devices) - online_count}</code>\n\n"
     )
     if current:
-        body += f"<b>Активный ПК</b>: {html.escape(current['display_name'])} | <code>{status_badge(current)}</code>\n\n"
+        body += f"<b>Активный ПК</b>: {html.escape(effective_display_name(current))} | <code>{status_badge(current)}</code>\n\n"
     if devices:
         lines: list[str] = []
         for index, device in enumerate(devices, start=1):
             marker = "<code>ACTIVE</code> | " if current and current["device_id"] == device["device_id"] else ""
             lines.append(
-                f"{index}. {marker}<b>{html.escape(device['display_name'])}</b> | <code>{status_badge(device)}</code> | "
+                f"{index}. {marker}<b>{html.escape(effective_display_name(device))}</b> | <code>{status_badge(device)}</code> | "
                 f"{html.escape(format_relative_age(device.get('last_seen')))} | <code>{html.escape(device['device_id'])}</code>"
             )
         body += "\n".join(lines)
@@ -1762,6 +1809,29 @@ async def text_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await send_text(update, context, "Использование: /text <текст>")
         return
     await run_for_current(update, context, "show_text", {"text": text_value}, use_cache=False)
+
+
+async def rename_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await authorize(update) or update.effective_chat is None:
+        return
+    device = await selected_device(update.effective_chat.id)
+    if not device:
+        await send_text(update, context, "ПК не выбран. Сначала открой /pcs.")
+        return
+    new_name = extract_command_text(update)
+    if not new_name:
+        await send_text(
+            update,
+            context,
+            "Использование: /rename <новая подпись>. Пустое имя не принимается.",
+            reply_markup=maintenance_keyboard(),
+        )
+        return
+    updated = await store.set_bot_label(device["device_id"], new_name)
+    if not updated:
+        await send_text(update, context, "ПК не найден.")
+        return
+    await show_device_root(update, context, updated)
 
 
 async def pic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1974,6 +2044,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"{EMOJI['text']} Использование: <code>/text тут твой текст</code>",
             reply_markup=control_keyboard(),
             parse_mode="HTML",
+        )
+        return
+    if data == "action:rename_help":
+        await send_text(
+            update,
+            context,
+            "Использование: /rename <новая подпись>. Это меняет только имя в боте.",
+            reply_markup=maintenance_keyboard(),
         )
         return
     if data == "action:section:monitor":
@@ -2761,6 +2839,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("wifi", wifi_command))
     app.add_handler(CommandHandler("update", update_agent_command))
     app.add_handler(CommandHandler("text", text_command))
+    app.add_handler(CommandHandler("rename", rename_command))
     app.add_handler(CommandHandler("pic", pic_command))
     app.add_handler(CommandHandler("file", file_command))
     app.add_handler(CommandHandler("wls", wls_command))
