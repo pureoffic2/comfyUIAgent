@@ -98,13 +98,39 @@ function Reset-BrokenVenv {
 
 function Resolve-PythonCommand {
     $pyCmd = Get-Command py -ErrorAction SilentlyContinue
-    if ($pyCmd) {
-        return @($pyCmd.Source, "-3")
+    if ($pyCmd -and (Test-Path $pyCmd.Source)) {
+        return @{
+            FilePath   = $pyCmd.Source
+            PrefixArgs = @("-3")
+        }
     }
 
-    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-    if ($pythonCmd) {
-        return @($pythonCmd.Source)
+    $pythonCandidates = @()
+    foreach ($candidate in @(
+        (Get-Command python -ErrorAction SilentlyContinue),
+        (Get-ChildItem "$env:LOCALAPPDATA\Programs\Python" -Filter python.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1)
+    )) {
+        if ($null -eq $candidate) {
+            continue
+        }
+        $source = if ($candidate.PSObject.Properties["Source"]) { $candidate.Source } else { $candidate.FullName }
+        if (-not $source) {
+            continue
+        }
+        if ($source -like "*\WindowsApps\python.exe") {
+            continue
+        }
+        if (Test-Path $source) {
+            $pythonCandidates += $source
+        }
+    }
+
+    $pythonPath = $pythonCandidates | Select-Object -First 1
+    if ($pythonPath) {
+        return @{
+            FilePath   = $pythonPath
+            PrefixArgs = @()
+        }
     }
 
     throw "Python 3 was not found. Install Python 3 and try again."
@@ -113,13 +139,44 @@ function Resolve-PythonCommand {
 function Invoke-Checked {
     param(
         [Parameter(Mandatory = $true)]
-        [string[]]$Command
+        [string]$FilePath,
+
+        [string[]]$ArgumentList = @()
     )
 
-    & $Command[0] $Command[1..($Command.Length - 1)]
+    & $FilePath @ArgumentList
     if ($LASTEXITCODE -ne 0) {
-        $commandText = [string]::Join(" ", $Command)
+        $commandText = ([string]::Join(" ", @($FilePath) + $ArgumentList))
         throw ("Command failed with exit code {0}: {1}" -f $LASTEXITCODE, $commandText)
+    }
+}
+
+function Invoke-CheckedCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Command,
+
+        [string[]]$ArgumentList = @()
+    )
+
+    Invoke-Checked -FilePath $Command.FilePath -ArgumentList ($Command.PrefixArgs + $ArgumentList)
+}
+
+function Try-Invoke-Checked {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [string[]]$ArgumentList = @()
+    )
+
+    try {
+        Invoke-Checked -FilePath $FilePath -ArgumentList $ArgumentList
+        return $true
+    }
+    catch {
+        Write-Host "==> Warning: $($_.Exception.Message)"
+        return $false
     }
 }
 
@@ -170,17 +227,25 @@ Invoke-Download -Uri $AgentUrl -OutFile $agentPath
 Reset-BrokenVenv -VenvPath $venvPath -VenvPython $venvPython
 if (-not (Test-Path -LiteralPath $venvPython)) {
     Write-Step "Creating virtual environment"
-    Invoke-Checked -Command ($pythonCmd + @("-m", "venv", $venvPath))
+    if (Test-Path $venvPath) {
+        Remove-Item -LiteralPath $venvPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Invoke-CheckedCommand -Command $pythonCmd -ArgumentList @("-m", "venv", $venvPath)
+    if (-not (Test-Path $venvPython)) {
+        throw "Virtual environment creation failed: $venvPython was not created."
+    }
 }
 else {
     Write-Step "Using existing virtual environment"
 }
+Write-Step "Bootstrapping pip"
+Try-Invoke-Checked -FilePath $venvPython -ArgumentList @("-m", "ensurepip", "--upgrade") | Out-Null
 
 Write-Step "Upgrading pip"
-Invoke-Checked -Command @($venvPython, "-m", "pip", "install", "--upgrade", "pip")
+Try-Invoke-Checked -FilePath $venvPython -ArgumentList @("-m", "pip", "install", "--disable-pip-version-check", "--upgrade", "pip") | Out-Null
 
 Write-Step "Installing dependencies"
-Invoke-Checked -Command @($venvPython, "-m", "pip", "install", "requests", "psutil", "pillow")
+Invoke-Checked -FilePath $venvPython -ArgumentList @("-m", "pip", "install", "--disable-pip-version-check", "requests", "psutil", "pillow")
 
 Write-Step "Saving update source"
 Invoke-HiddenPython -FilePath $venvPythonw -ArgumentList @($agentPath, "--set-update-url", $AgentUrl)
