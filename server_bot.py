@@ -278,7 +278,14 @@ class Store:
     def _load(self) -> dict[str, Any]:
         ensure_dirs()
         if self.path.exists():
-            state = sanitize_json_value(json.loads(self.path.read_text(encoding="utf-8")))
+            try:
+                raw_state = self.path.read_text(encoding="utf-8")
+                state = sanitize_json_value(json.loads(raw_state))
+            except (OSError, json.JSONDecodeError):
+                broken_path = self.path.with_suffix(f".broken-{int(utc_now().timestamp())}.json")
+                with contextlib.suppress(OSError):
+                    shutil.move(str(self.path), str(broken_path))
+                state = {"owner_chat_id": None, "devices": {}, "chat_preferences": {}}
             state.setdefault("owner_chat_id", None)
             state.setdefault("devices", {})
             state.setdefault("chat_preferences", {})
