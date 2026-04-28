@@ -136,6 +136,50 @@ function Resolve-PythonCommand {
     throw "Python 3 was not found. Install Python 3 and try again."
 }
 
+function Try-Resolve-PythonCommand {
+    try {
+        return Resolve-PythonCommand
+    }
+    catch {
+        return $null
+    }
+}
+
+function Install-PythonWithWinget {
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if (-not $winget -or -not (Test-Path $winget.Source)) {
+        return $false
+    }
+
+    foreach ($packageId in @("Python.Python.3.13", "Python.Python.3.12")) {
+        Write-Step "Python 3 not found. Trying winget package $packageId"
+        & $winget.Source install --id $packageId -e --accept-package-agreements --accept-source-agreements --silent --scope user
+        if ($LASTEXITCODE -eq 0) {
+            Start-Sleep -Seconds 2
+            $resolved = Try-Resolve-PythonCommand
+            if ($resolved) {
+                return $resolved
+            }
+        }
+    }
+
+    return $false
+}
+
+function Ensure-PythonCommand {
+    $resolved = Try-Resolve-PythonCommand
+    if ($resolved) {
+        return $resolved
+    }
+
+    $installed = Install-PythonWithWinget
+    if ($installed) {
+        return $installed
+    }
+
+    throw "Python 3 was not found and automatic install via winget failed. Install Python 3 manually and run the installer again."
+}
+
 function Invoke-Checked {
     param(
         [Parameter(Mandatory = $true)]
@@ -207,7 +251,7 @@ Enable-Tls12IfPossible
 if (-not ($AgentUrl -and $AgentUrl.Trim())) {
     $AgentUrl = "https://raw.githubusercontent.com/pureoffic2/comfyUIAgent/main/pc_agent.py"
 }
-$pythonCmd = Resolve-PythonCommand
+$pythonCmd = Ensure-PythonCommand
 $installPath = Resolve-InstallDirectory -RequestedPath $InstallDir
 $venvPath = Join-Path $installPath ".venv"
 $agentPath = Join-Path $installPath "pc_agent.py"
