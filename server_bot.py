@@ -106,6 +106,20 @@ def trim_text(value: str, limit: int) -> tuple[str, bool]:
     return f"{text[: limit - 3].rstrip()}...", True
 
 
+def sanitize_text(value: str) -> str:
+    return re.sub(r"[\ud800-\udfff]", "\uFFFD", value)
+
+
+def sanitize_json_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return sanitize_text(value)
+    if isinstance(value, list):
+        return [sanitize_json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {sanitize_json_value(key): sanitize_json_value(item) for key, item in value.items()}
+    return value
+
+
 def last_seen_at(device: dict[str, Any]) -> datetime | None:
     raw_last_seen = device.get("last_seen")
     if not raw_last_seen:
@@ -264,7 +278,7 @@ class Store:
     def _load(self) -> dict[str, Any]:
         ensure_dirs()
         if self.path.exists():
-            state = json.loads(self.path.read_text(encoding="utf-8"))
+            state = sanitize_json_value(json.loads(self.path.read_text(encoding="utf-8")))
             state.setdefault("owner_chat_id", None)
             state.setdefault("devices", {})
             state.setdefault("chat_preferences", {})
@@ -277,6 +291,7 @@ class Store:
         return state
 
     def _save_unlocked(self) -> None:
+        self.state = sanitize_json_value(self.state)
         self.path.write_text(
             json.dumps(self.state, indent=2, ensure_ascii=False),
             encoding="utf-8",
