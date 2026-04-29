@@ -6,6 +6,7 @@ import contextlib
 import html
 import io
 import json
+import mimetypes
 import os
 import platform
 import re
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
@@ -45,10 +46,13 @@ CMD_OUTPUT_PREVIEW_CHARS = int(os.environ.get("PCBOT_CMD_OUTPUT_PREVIEW", "1000"
 PUBLIC_BASE_URL = os.environ.get("PCBOT_PUBLIC_BASE_URL", "").strip().rstrip("/")
 REMOTE_SESSION_TTL_SECONDS = int(os.environ.get("PCBOT_REMOTE_SESSION_TTL", "43200"))
 REMOTE_FRAME_TIMEOUT_SECONDS = int(os.environ.get("PCBOT_REMOTE_FRAME_TIMEOUT", "8"))
+UPLOAD_FILE_LIMIT_BYTES = int(os.environ.get("PCBOT_UPLOAD_FILE_LIMIT", str(49 * 1024 * 1024)))
 AUTO_PUBLIC_TUNNEL = os.environ.get("PCBOT_AUTO_PUBLIC_TUNNEL", "1").strip().lower() not in {"0", "false", "off", "no"}
 CLOUDFLARED_DIR = DATA_DIR / "cloudflared"
 CLOUDFLARED_BIN = CLOUDFLARED_DIR / ("cloudflared.exe" if os.name == "nt" else "cloudflared")
 CLOUDFLARED_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.IGNORECASE)
+PHOTO_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
 
 
 def utc_now() -> datetime:
@@ -118,6 +122,28 @@ def sanitize_json_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {sanitize_json_value(key): sanitize_json_value(item) for key, item in value.items()}
     return value
+
+
+def safe_upload_filename(value: str | None) -> str:
+    name = Path(value or "result.bin").name.strip() or "result.bin"
+    name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip(" .")
+    return name[:140] or "result.bin"
+
+
+def upload_path_for(command_id: str, file_name: str) -> Path:
+    safe_command = re.sub(r"[^A-Za-z0-9_-]+", "_", command_id)[:64] or secrets.token_hex(8)
+    return UPLOAD_DIR / f"{safe_command}_{safe_upload_filename(file_name)}"
+
+
+def trusted_upload_path(value: str | None) -> Path | None:
+    if not value:
+        return None
+    try:
+        path = Path(value).resolve()
+        path.relative_to(UPLOAD_DIR.resolve())
+    except (OSError, ValueError):
+        return None
+    return path if path.exists() and path.is_file() else None
 
 
 def last_seen_at(device: dict[str, Any]) -> datetime | None:
@@ -527,9 +553,12 @@ class Store:
                     continue
                 command["status"] = "completed" if payload.ok else "failed"
                 file_path = None
-                if payload.file_b64 and payload.file_name:
+                uploaded_path = trusted_upload_path(str(payload.data.get("uploaded_file_path", "")))
+                if uploaded_path:
+                    file_path = uploaded_path
+                elif payload.file_b64 and payload.file_name:
                     raw = base64.b64decode(payload.file_b64)
-                    file_path = UPLOAD_DIR / f"{payload.command_id}_{payload.file_name}"
+                    file_path = upload_path_for(payload.command_id, payload.file_name)
                     file_path.write_bytes(raw)
                 command["result"] = {
                     "ok": payload.ok,
@@ -541,6 +570,16 @@ class Store:
                 }
                 self._save_unlocked()
                 return
+            raise HTTPException(status_code=404, detail="command not found")
+
+    async def verify_command_upload(self, device_id: str, agent_token: str, command_id: str) -> None:
+        async with self.lock:
+            device = self.state.get("devices", {}).get(device_id)
+            if not device or device.get("agent_token") != agent_token:
+                raise HTTPException(status_code=403, detail="invalid agent token")
+            for command in device.get("commands", []):
+                if command["id"] == command_id and command.get("status") in {"queued", "in_progress"}:
+                    return
             raise HTTPException(status_code=404, detail="command not found")
 
     async def get_command(self, device_id: str, command_id: str) -> dict[str, Any] | None:
@@ -1066,8 +1105,10 @@ def help_text() -> str:
         "<b>Обслуживание</b>\n\n"
         "/wifi - вручную попросить агент переподключить Wi-Fi\n"
         "/update - обновить агент с GitHub\n"
+        "/scan или /antivirus - Defender quick scan и удаление найденных угроз\n"
         "/text &lt;текст&gt; - показать отдельное окно с текстом на экране ПК\n\n"
         "/pic &lt;ссылка&gt; или reply на фото - показать картинку на экране ПК\n\n"
+        "/video &lt;ссылка&gt; или reply на видео - открыть видео на экране ПК\n\n"
         "/file &lt;имя или путь&gt; - найти файл и отправить его в Telegram\n\n"
         "/wls - открыть панель WLS / Ubuntu SSH\n\n"
         "Уведомления об онлайне и оффлайне приходят автоматически. Mini App удалённого экрана доступен из меню выбранного ПК и поднимается через автотуннель."
@@ -1204,6 +1245,7 @@ def maintenance_keyboard() -> InlineKeyboardMarkup:
                 premium_button("Wi-Fi", callback_data="action:wifi", emoji_id=5447602197439218445),
                 premium_button("Update", callback_data="action:update", emoji_id=5445388803223091254),
             ],
+            [premium_button("Антивирус", callback_data="action:defender_scan", emoji_id=5444869180899752137)],
             [premium_button("Переименовать", callback_data="action:rename_help", emoji_id=5445128296276718145)],
             [premium_button("Удалить", callback_data="action:delete_prompt", emoji_id=5445005936953424165)],
             [premium_button("Назад", callback_data="action:menu_root", emoji_id=5445362436418859744)],
@@ -1476,6 +1518,28 @@ async def send_text(
     )
 
 
+async def save_telegram_media_for_agent(
+    context: ContextTypes.DEFAULT_TYPE,
+    file_id: str,
+    fallback_suffix: str,
+) -> dict[str, Any]:
+    tg_file = await context.bot.get_file(file_id)
+    raw = bytes(await tg_file.download_as_bytearray())
+    if len(raw) > UPLOAD_FILE_LIMIT_BYTES:
+        raise ValueError(f"Файл слишком большой для передачи через бота: {format_bytes(len(raw))}.")
+    source_name = str(getattr(tg_file, "file_path", "") or "")
+    suffix = Path(source_name).suffix.lower() or fallback_suffix
+    file_name = safe_upload_filename(f"incoming_{secrets.token_urlsafe(18)}{suffix}")
+    ensure_dirs()
+    path = UPLOAD_DIR / file_name
+    path.write_bytes(raw)
+    return {
+        "media_path": f"/api/incoming/{file_name}",
+        "file_name": file_name,
+        "size_bytes": len(raw),
+    }
+
+
 def command_reply_markup(
     command_type: str,
     payload: dict[str, Any] | None = None,
@@ -1503,9 +1567,9 @@ def command_reply_markup(
         reply_markup = wls_keyboard()
     if command_type in {"close_app", "kill_process", "run_job", "restart_app", "run_alias", "top", "apps", "jobs"} and reply_markup is None:
         reply_markup = apps_section_keyboard()
-    if command_type in {"lock_pc", "restart_pc", "shutdown_pc", "show_text", "close_foreground_window"}:
+    if command_type in {"lock_pc", "restart_pc", "shutdown_pc", "show_text", "show_picture", "show_video", "close_foreground_window"}:
         reply_markup = control_keyboard()
-    if command_type in {"wifi_recover", "self_update", "find_file"}:
+    if command_type in {"wifi_recover", "self_update", "find_file", "defender_scan"}:
         reply_markup = maintenance_keyboard()
     return reply_markup
 
@@ -1544,22 +1608,50 @@ async def send_result(
     reply_markup = command_reply_markup(command_type, payload)
     file_path = payload.get("file_path")
     if file_path and Path(file_path).exists():
-        suffix = Path(file_path).suffix.lower()
-        raw = Path(file_path).read_bytes()
-        buffer = io.BytesIO(raw)
-        buffer.name = payload.get("file_name") or Path(file_path).name
-        if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
-            await context.bot.send_photo(
-                chat_id=update.effective_chat.id,
-                photo=buffer,
-                caption=payload.get("message") or None,
-            )
-        else:
-            await context.bot.send_document(
-                chat_id=update.effective_chat.id,
-                document=buffer,
-                filename=buffer.name,
-            )
+        path = Path(file_path)
+        suffix = path.suffix.lower()
+        file_name = payload.get("file_name") or path.name
+        caption = payload.get("message") or None
+        with path.open("rb") as handle:
+            if suffix in PHOTO_SUFFIXES:
+                try:
+                    await context.bot.send_photo(
+                        chat_id=update.effective_chat.id,
+                        photo=handle,
+                        caption=caption,
+                    )
+                except BadRequest:
+                    handle.seek(0)
+                    await context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=handle,
+                        filename=file_name,
+                        caption=caption,
+                    )
+            elif suffix in VIDEO_SUFFIXES:
+                try:
+                    await context.bot.send_video(
+                        chat_id=update.effective_chat.id,
+                        video=handle,
+                        filename=file_name,
+                        caption=caption,
+                        supports_streaming=True,
+                    )
+                except BadRequest:
+                    handle.seek(0)
+                    await context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=handle,
+                        filename=file_name,
+                        caption=caption,
+                    )
+            else:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=handle,
+                    filename=file_name,
+                    caption=caption,
+                )
         if command_type == "find_file":
             await send_text(update, context, payload.get("message", "").strip() or "Файл отправлен.", reply_markup=maintenance_keyboard())
         return
@@ -1573,6 +1665,7 @@ async def run_for_current(
     command_type: str,
     args: dict[str, Any] | None = None,
     use_cache: bool = True,
+    timeout_seconds: int | float | None = None,
 ) -> None:
     if not await authorize(update):
         return
@@ -1586,7 +1679,7 @@ async def run_for_current(
     if use_cache and cached is not None:
         await send_text(update, context, cached, reply_markup=command_reply_markup(command_type))
         return
-    result = await run_and_wait(device["device_id"], command_type, args)
+    result = await run_and_wait(device["device_id"], command_type, args, timeout_seconds=timeout_seconds)
     await send_result(update, context, command_type, result)
 
 
@@ -1824,6 +1917,10 @@ async def update_agent_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await send_result(update, context, "self_update", result)
 
 
+async def defender_scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await run_for_current(update, context, "defender_scan", use_cache=False, timeout_seconds=300)
+
+
 async def text_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text_value = extract_command_text(update)
     if not text_value:
@@ -1865,25 +1962,61 @@ async def pic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     args_text = extract_command_text(update)
     payload: dict[str, Any] | None = None
 
-    reply = message.reply_to_message
-    if reply and reply.photo:
-        photo = reply.photo[-1]
-        tg_file = await context.bot.get_file(photo.file_id)
-        image_bytes = bytes(await tg_file.download_as_bytearray())
-        payload = {
-            "image_b64": base64.b64encode(image_bytes).decode("ascii"),
-            "source": "telegram_photo",
-        }
-    elif args_text and re.match(r"^https?://", args_text, flags=re.IGNORECASE):
-        payload = {
-            "url": args_text.strip(),
-            "source": "url",
-        }
+    try:
+        reply = message.reply_to_message
+        if reply and reply.photo:
+            photo = reply.photo[-1]
+            payload = await save_telegram_media_for_agent(context, photo.file_id, ".jpg")
+            payload["source"] = "telegram_photo"
+        elif args_text and re.match(r"^https?://", args_text, flags=re.IGNORECASE):
+            payload = {
+                "url": args_text.strip(),
+                "source": "url",
+            }
+    except Exception as exc:
+        await send_text(update, context, f"Не удалось подготовить фото: {exc}", reply_markup=control_keyboard())
+        return
 
     if payload is None:
         await send_text(update, context, "Использование: /pic <ссылка> или reply на фото.", reply_markup=control_keyboard())
         return
     await run_for_current(update, context, "show_picture", payload, use_cache=False)
+
+
+async def video_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await authorize(update):
+        return
+    message = update.effective_message
+    if message is None:
+        return
+    args_text = extract_command_text(update)
+    payload: dict[str, Any] | None = None
+
+    try:
+        reply = message.reply_to_message
+        if reply and reply.video:
+            payload = await save_telegram_media_for_agent(context, reply.video.file_id, ".mp4")
+            payload["source"] = "telegram_video"
+        elif reply and reply.animation:
+            payload = await save_telegram_media_for_agent(context, reply.animation.file_id, ".mp4")
+            payload["source"] = "telegram_animation"
+        elif reply and reply.document and str(reply.document.mime_type or "").lower().startswith("video/"):
+            suffix = Path(reply.document.file_name or "").suffix.lower() or ".mp4"
+            payload = await save_telegram_media_for_agent(context, reply.document.file_id, suffix)
+            payload["source"] = "telegram_document"
+        elif args_text and re.match(r"^https?://", args_text, flags=re.IGNORECASE):
+            payload = {
+                "url": args_text.strip(),
+                "source": "url",
+            }
+    except Exception as exc:
+        await send_text(update, context, f"Не удалось подготовить видео: {exc}", reply_markup=control_keyboard())
+        return
+
+    if payload is None:
+        await send_text(update, context, "Использование: /video <ссылка> или reply на видео.", reply_markup=control_keyboard())
+        return
+    await run_for_current(update, context, "show_video", payload, use_cache=False)
 
 
 async def file_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2116,7 +2249,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await send_text(
             update,
             context,
-            section_text("Обслуживание", "Wi-Fi recovery, update агента и удаление установки."),
+            section_text("Обслуживание", "Wi-Fi recovery, update агента, Defender scan и удаление установки."),
             reply_markup=maintenance_keyboard(),
             parse_mode="HTML",
         )
@@ -2181,6 +2314,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "action:close_active": close_active_command,
         "action:wifi": wifi_command,
         "action:update": update_agent_command,
+        "action:defender_scan": defender_scan_command,
     }
     handler = mapping.get(data)
     if handler:
@@ -2831,10 +2965,53 @@ async def api_command_next(payload: NextCommandRequest) -> dict[str, Any]:
     return {"command": await store.get_next_command(payload)}
 
 
+@api.post("/api/command/upload")
+async def api_command_upload(
+    request: Request,
+    device_id: str,
+    agent_token: str,
+    command_id: str,
+    file_name: str,
+) -> dict[str, Any]:
+    await store.verify_command_upload(device_id, agent_token, command_id)
+    ensure_dirs()
+    clean_name = safe_upload_filename(file_name)
+    path = upload_path_for(command_id, clean_name)
+    total = 0
+    try:
+        with path.open("wb") as handle:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > UPLOAD_FILE_LIMIT_BYTES:
+                    raise HTTPException(status_code=413, detail="file too large")
+                handle.write(chunk)
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+        raise
+    return {
+        "ok": True,
+        "file_path": str(path),
+        "file_name": clean_name,
+        "size_bytes": total,
+    }
+
+
 @api.post("/api/command/result")
 async def api_command_result(payload: CommandResultRequest) -> dict[str, Any]:
     await store.complete_command(payload)
     return {"ok": True}
+
+
+@api.get("/api/incoming/{file_name}")
+async def api_incoming_media(file_name: str) -> Response:
+    path = trusted_upload_path(str(UPLOAD_DIR / safe_upload_filename(file_name)))
+    if not path:
+        raise HTTPException(status_code=404, detail="media not found")
+    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    return Response(path.read_bytes(), media_type=media_type)
 
 
 def register_handlers(app: Application) -> None:
@@ -2863,7 +3040,10 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("text", text_command))
     app.add_handler(CommandHandler("rename", rename_command))
     app.add_handler(CommandHandler("pic", pic_command))
+    app.add_handler(CommandHandler("video", video_command))
     app.add_handler(CommandHandler("file", file_command))
+    app.add_handler(CommandHandler("scan", defender_scan_command))
+    app.add_handler(CommandHandler("antivirus", defender_scan_command))
     app.add_handler(CommandHandler("wls", wls_command))
     app.add_handler(CommandHandler("cmd", cmd_command))
     app.add_handler(CommandHandler("run", run_command))

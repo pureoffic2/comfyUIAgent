@@ -92,10 +92,11 @@ DEFAULT_AGENT_UPDATE_URL = os.environ.get(
 HEARTBEAT_INTERVAL_SECONDS = max(3.0, float(os.environ.get("PCBOT_HEARTBEAT_INTERVAL", "5")))
 COMMAND_POLL_SECONDS = max(0.02, float(os.environ.get("PCBOT_COMMAND_POLL", "0.02")))
 HTTP_TIMEOUT_SECONDS = max(5, int(os.environ.get("PCBOT_HTTP_TIMEOUT", "12")))
+UPLOAD_TIMEOUT_SECONDS = max(30, int(os.environ.get("PCBOT_UPLOAD_TIMEOUT", "180")))
 WIFI_RECOVERY_COOLDOWN_SECONDS = max(10.0, float(os.environ.get("PCBOT_WIFI_RECOVERY_COOLDOWN", "35")))
 WIFI_CONNECT_SETTLE_SECONDS = max(3.0, float(os.environ.get("PCBOT_WIFI_CONNECT_SETTLE", "6")))
 TEXT_WINDOW_SECONDS = max(5, int(os.environ.get("PCBOT_TEXT_WINDOW_SECONDS", "25")))
-AGENT_VERSION = "1.6.1"
+AGENT_VERSION = "1.6.2"
 SHELL_COMMAND_TIMEOUT_SECONDS = 25
 SHELL_COMMAND_CWD = str(Path.home())
 SHELL_COMMAND_PREVIEW_CHARS = 1600
@@ -1039,7 +1040,14 @@ def post_result(
     data: dict[str, Any] | None = None,
     file_name: str | None = None,
     file_b64: str | None = None,
+    file_path: str | None = None,
 ) -> None:
+    payload_data = dict(data or {})
+    if file_path:
+        upload = upload_result_file(session, state, command_id, Path(file_path), file_name)
+        payload_data["uploaded_file_path"] = upload["file_path"]
+        payload_data["uploaded_size_bytes"] = upload["size_bytes"]
+        file_name = upload.get("file_name") or file_name
     response = session.post(
         f"{SERVER_URL}/api/command/result",
         json={
@@ -1048,13 +1056,39 @@ def post_result(
             "command_id": command_id,
             "ok": ok,
             "message": message,
-            "data": data or {},
+            "data": payload_data,
             "file_name": file_name,
             "file_b64": file_b64,
         },
         timeout=HTTP_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
+
+
+def upload_result_file(
+    session: requests.Session,
+    state: dict[str, Any],
+    command_id: str,
+    path: Path,
+    file_name: str | None = None,
+) -> dict[str, Any]:
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(str(path))
+    with path.open("rb") as handle:
+        response = session.post(
+            f"{SERVER_URL}/api/command/upload",
+            params={
+                "device_id": state["device_id"],
+                "agent_token": state["agent_token"],
+                "command_id": command_id,
+                "file_name": file_name or path.name,
+            },
+            data=handle,
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=UPLOAD_TIMEOUT_SECONDS,
+        )
+    response.raise_for_status()
+    return response.json()
 
 
 def info_text(snapshot: dict[str, Any]) -> str:
@@ -1579,7 +1613,7 @@ def send_found_file(query: str) -> dict[str, Any]:
             "size_bytes": size_bytes,
         },
         "file_name": path.name,
-        "file_b64": base64.b64encode(path.read_bytes()).decode("ascii"),
+        "file_path_local": str(path),
     }
 
 
@@ -1593,6 +1627,70 @@ def run_hidden_capture(command: list[str], timeout: int = 60) -> tuple[int, str,
         **hidden_subprocess_kwargs(),
     )
     return completed.returncode, decode_process_output(completed.stdout), decode_process_output(completed.stderr)
+
+
+def defender_scan_and_clean() -> dict[str, Any]:
+    if platform.system().lower() != "windows":
+        raise RuntimeError("Microsoft Defender scan доступен только на Windows.")
+    script = r"""
+$ErrorActionPreference = 'Continue'
+if (-not (Get-Command Start-MpScan -ErrorAction SilentlyContinue)) {
+  [pscustomobject]@{Available=$false; Error='Microsoft Defender PowerShell cmdlets are unavailable'} | ConvertTo-Json -Compress
+  exit 2
+}
+$updateError = $null
+$scanError = $null
+$removeError = $null
+try { Update-MpSignature -ErrorAction Stop | Out-Null } catch { $updateError = $_.Exception.Message }
+try { Start-MpScan -ScanType QuickScan -ErrorAction Stop | Out-Null } catch { $scanError = $_.Exception.Message }
+$before = @(Get-MpThreatDetection -ErrorAction SilentlyContinue | Select-Object ThreatName,ThreatID,Resources,ActionSuccess,InitialDetectionTime,LastThreatStatusChangeTime)
+if ($before.Count -gt 0) {
+  try { Remove-MpThreat -ErrorAction Stop | Out-Null } catch { $removeError = $_.Exception.Message }
+}
+Start-Sleep -Seconds 1
+$after = @(Get-MpThreatDetection -ErrorAction SilentlyContinue | Select-Object ThreatName,ThreatID,Resources,ActionSuccess,InitialDetectionTime,LastThreatStatusChangeTime)
+[pscustomobject]@{
+  Available=$true
+  UpdateError=$updateError
+  ScanError=$scanError
+  RemoveError=$removeError
+  Detected=$before.Count
+  Remaining=$after.Count
+  Detections=$before
+  RemainingDetections=$after
+} | ConvertTo-Json -Depth 8 -Compress
+if ($scanError) { exit 1 }
+exit 0
+"""
+    code, stdout, stderr = run_hidden_capture(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+        timeout=1800,
+    )
+    payload: dict[str, Any] = {}
+    if stdout.strip():
+        with contextlib.suppress(json.JSONDecodeError):
+            parsed = json.loads(stdout)
+            if isinstance(parsed, dict):
+                payload = parsed
+    if code != 0 and not payload:
+        raise RuntimeError((stderr or stdout or "Defender scan failed").strip())
+    if not payload.get("Available", True):
+        raise RuntimeError(str(payload.get("Error") or "Microsoft Defender недоступен."))
+    detected = int(payload.get("Detected") or 0)
+    remaining = int(payload.get("Remaining") or 0)
+    parts = [
+        "Microsoft Defender quick scan завершён.",
+        f"Найдено угроз: {detected}.",
+        f"Осталось после очистки: {remaining}.",
+    ]
+    for key, label in (("UpdateError", "Ошибка обновления баз"), ("ScanError", "Ошибка сканирования"), ("RemoveError", "Ошибка удаления")):
+        if payload.get(key):
+            parts.append(f"{label}: {payload[key]}")
+    return {
+        "ok": True,
+        "message": "\n".join(parts),
+        "data": payload,
+    }
 
 
 def list_wsl_distros() -> list[str]:
@@ -2364,19 +2462,37 @@ def render_popup_window(text: str) -> None:
     root.mainloop()
 
 
+def media_url_from_args(args: dict[str, Any]) -> str:
+    media_path = str(args.get("media_path", "")).strip()
+    if media_path:
+        return f"{SERVER_URL.rstrip('/')}/{media_path.lstrip('/')}"
+    return str(args.get("url", "")).strip()
+
+
+def media_suffix_from_url(url: str, fallback: str) -> str:
+    suffix = Path(urlparse(url).path).suffix.lower()
+    if suffix and len(suffix) <= 8:
+        return suffix
+    return fallback
+
+
+def download_media_bytes(args: dict[str, Any], fallback_suffix: str) -> tuple[bytes, str]:
+    if args.get("image_b64"):
+        return base64.b64decode(str(args.get("image_b64"))), fallback_suffix
+    if args.get("video_b64"):
+        return base64.b64decode(str(args.get("video_b64"))), fallback_suffix
+    media_url = media_url_from_args(args)
+    if not media_url:
+        raise ValueError("Не передана ссылка на медиа.")
+    response = requests.get(media_url, timeout=60)
+    response.raise_for_status()
+    return response.content, media_suffix_from_url(media_url, fallback_suffix)
+
+
 def show_picture_popup(args: dict[str, Any]) -> dict[str, Any]:
     if "tk" not in globals():
         raise RuntimeError("Tkinter недоступен для показа изображения.")
-    image_bytes: bytes | None = None
-    if args.get("image_b64"):
-        image_bytes = base64.b64decode(str(args.get("image_b64")))
-    else:
-        image_url = str(args.get("url", "")).strip()
-        if not image_url:
-            raise ValueError("Не передана ссылка на изображение.")
-        response = requests.get(image_url, timeout=20)
-        response.raise_for_status()
-        image_bytes = response.content
+    image_bytes, _ = download_media_bytes(args, ".jpg")
     if not image_bytes:
         raise ValueError("Не удалось получить изображение.")
 
@@ -2421,6 +2537,21 @@ def show_picture_popup(args: dict[str, Any]) -> dict[str, Any]:
         "ok": True,
         "message": "Изображение показано на экране.",
         "data": {"width": width, "height": height},
+    }
+
+
+def show_video_file(args: dict[str, Any]) -> dict[str, Any]:
+    video_bytes, suffix = download_media_bytes(args, ".mp4")
+    if not video_bytes:
+        raise ValueError("Не удалось получить видео.")
+    suffix = suffix if suffix in {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"} else ".mp4"
+    path = Path(tempfile.gettempdir()) / f"systemportal_video_{secrets.token_hex(8)}{suffix}"
+    path.write_bytes(video_bytes)
+    os.startfile(str(path))
+    return {
+        "ok": True,
+        "message": f"Видео открыто: {path.name}",
+        "data": {"path": str(path), "size_bytes": len(video_bytes)},
     }
 
 
@@ -2538,6 +2669,10 @@ def handle_command(command: dict[str, Any], snapshot: dict[str, Any], session: r
         return show_text_popup(str(args.get("text", "")))
     if command_type == "show_picture":
         return show_picture_popup(args)
+    if command_type == "show_video":
+        return show_video_file(args)
+    if command_type == "defender_scan":
+        return defender_scan_and_clean()
     if command_type == "wsl_info":
         return wsl_ssh_info()
     if command_type == "wifi_recover":
@@ -2609,6 +2744,7 @@ def run_loop() -> None:
                         data=result.get("data"),
                         file_name=result.get("file_name"),
                         file_b64=result.get("file_b64"),
+                        file_path=result.get("file_path_local"),
                     )
                     if result.get("restart_after_result"):
                         restart_self()
