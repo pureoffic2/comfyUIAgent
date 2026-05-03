@@ -60,9 +60,13 @@ GlobalAlloc = ctypes.windll.kernel32.GlobalAlloc
 GlobalLock = ctypes.windll.kernel32.GlobalLock
 GlobalUnlock = ctypes.windll.kernel32.GlobalUnlock
 RtlMoveMemory = ctypes.windll.kernel32.RtlMoveMemory
+CreateMutexW = ctypes.windll.kernel32.CreateMutexW
+GetLastError = ctypes.windll.kernel32.GetLastError
+CloseHandle = ctypes.windll.kernel32.CloseHandle
 WM_CLOSE = 0x0010
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
+ERROR_ALREADY_EXISTS = 183
 
 OpenClipboard.argtypes = [ctypes.wintypes.HWND]
 OpenClipboard.restype = ctypes.wintypes.BOOL
@@ -80,6 +84,12 @@ GlobalUnlock.argtypes = [ctypes.wintypes.HGLOBAL]
 GlobalUnlock.restype = ctypes.wintypes.BOOL
 RtlMoveMemory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
 RtlMoveMemory.restype = None
+CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.wintypes.BOOL, ctypes.wintypes.LPCWSTR]
+CreateMutexW.restype = ctypes.wintypes.HANDLE
+GetLastError.argtypes = []
+GetLastError.restype = ctypes.wintypes.DWORD
+CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+CloseHandle.restype = ctypes.wintypes.BOOL
 
 
 # Edit these values first.
@@ -96,7 +106,7 @@ UPLOAD_TIMEOUT_SECONDS = max(30, int(os.environ.get("PCBOT_UPLOAD_TIMEOUT", "180
 WIFI_RECOVERY_COOLDOWN_SECONDS = max(10.0, float(os.environ.get("PCBOT_WIFI_RECOVERY_COOLDOWN", "35")))
 WIFI_CONNECT_SETTLE_SECONDS = max(3.0, float(os.environ.get("PCBOT_WIFI_CONNECT_SETTLE", "6")))
 TEXT_WINDOW_SECONDS = max(5, int(os.environ.get("PCBOT_TEXT_WINDOW_SECONDS", "25")))
-AGENT_VERSION = "1.6.2"
+AGENT_VERSION = "1.6.3"
 SHELL_COMMAND_TIMEOUT_SECONDS = 25
 SHELL_COMMAND_CWD = str(Path.home())
 SHELL_COMMAND_PREVIEW_CHARS = 1600
@@ -180,6 +190,7 @@ BASE_DIR = Path(__file__).resolve().parent
 STATE_PATH = BASE_DIR / "agent_state.json"
 LOCK_PATH = BASE_DIR / "agent.lock"
 AGENT_LOCK_HANDLE: Any | None = None
+AGENT_MUTEX_HANDLE: Any | None = None
 FILE_SEARCH_ROOTS = [
     Path.home() / "Desktop",
     Path.home() / "Downloads",
@@ -335,7 +346,16 @@ def save_state(state: dict[str, Any]) -> None:
 
 
 def ensure_single_instance() -> bool:
-    global AGENT_LOCK_HANDLE
+    global AGENT_LOCK_HANDLE, AGENT_MUTEX_HANDLE
+    if os.name == "nt":
+        mutex_suffix = hashlib.sha256(str(BASE_DIR).lower().encode("utf-8", errors="ignore")).hexdigest()[:16]
+        mutex_name = f"Local\\SystemPortalAgent-{mutex_suffix}"
+        mutex_handle = CreateMutexW(None, False, mutex_name)
+        if mutex_handle:
+            if GetLastError() == ERROR_ALREADY_EXISTS:
+                CloseHandle(mutex_handle)
+                return False
+            AGENT_MUTEX_HANDLE = mutex_handle
     if "msvcrt" not in globals():
         return True
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -352,6 +372,14 @@ def ensure_single_instance() -> bool:
     handle.flush()
     AGENT_LOCK_HANDLE = handle
     return True
+
+
+def create_http_session() -> requests.Session:
+    session = requests.Session()
+    # Windows can expose a per-user WinINET proxy that is not valid during
+    # unattended startup. The agent talks to a fixed VPS, so prefer direct IO.
+    session.trust_env = False
+    return session
 
 
 def hidden_startupinfo() -> Any | None:
@@ -2698,7 +2726,7 @@ def parse_args() -> argparse.Namespace:
 
 def run_loop() -> None:
     boost_process_priority()
-    session = requests.Session()
+    session = create_http_session()
     previous_net: dict[str, Any] | None = None
     cached_snapshot: dict[str, Any] | None = None
     last_heartbeat = 0.0
@@ -2758,7 +2786,7 @@ def run_loop() -> None:
             consecutive_network_failures += 1
             with contextlib.suppress(Exception):
                 session.close()
-            session = requests.Session()
+            session = create_http_session()
             if not network_reachable(timeout=1.0):
                 last_wifi_recovery_at, note = maybe_recover_wifi(
                     last_wifi_recovery_at,
